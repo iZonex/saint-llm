@@ -72,6 +72,26 @@ def test_loss_decreases_with_grouped_moe() -> None:
     assert losses[-1] < losses[0], f"loss did not decrease with grouped MoE: {losses}"
 
 
+@pytest.mark.parametrize("mode", ["fp8", "fp4"])
+def test_loss_decreases_with_grouped_moe_under_qat(mode: str) -> None:
+    """Closes the v0.1 quant-coverage matrix: grouped MoE pool also trains
+    when linear_quant is fp8 or fp4 (fake-quant on stacked weights + tokens)."""
+    torch.manual_seed(0)
+    cfg = ModelConfig.tiny().model_copy(update={
+        "moe_use_grouped_gemm": True,
+        "linear_quant": mode,
+    })
+    model = SaintLLM(cfg)
+    model.train()
+
+    optim = torch.optim.AdamW(model.parameters(), lr=3.0e-3)
+    token_ids = _fixed_token_batch(cfg)
+
+    losses = [_train_step_loss(model, token_ids, optim) for _ in range(4)]
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), losses
+    assert losses[-1] < losses[0], f"loss did not decrease with grouped MoE + {mode}: {losses}"
+
+
 @pytest.mark.gpu
 def test_loss_decreases_with_real_fp8_gemm() -> None:
     """End-to-end: SaintLLM trains under fp8 + use_real_fp8_gemm on Ada+."""

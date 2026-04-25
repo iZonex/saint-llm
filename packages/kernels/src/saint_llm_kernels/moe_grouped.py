@@ -14,15 +14,24 @@ where ``SwiGLU(W, x) = W_down @ (silu(W_gate x) * W_up x)`` with V4 clamping.
 
 This is the local (single-device) flavour of "MegaMoE EP". Multi-device EP
 (all-to-all dispatch) is the next layer up; this kernel is the building block.
+
+QAT support: ``linear_quant`` selects fp8 / fp4 fake-quant on inputs and
+stacked weights. The grouped matmul itself runs in bf16/fp32 — a real fused
+fp8 grouped GEMM via ``torch._scaled_grouped_mm`` requires Hopper sm9.0+
+(not Ada), so it stays a follow-up.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
+
+from saint_llm_kernels.quant import Fp8Format, fake_quant_fp4_mx, fake_quant_fp8
+
+GroupedQuantMode = Literal["bf16", "fp8", "fp4"]
 
 
 def _grouped_mm_supported(device: torch.device) -> bool:
@@ -90,6 +99,8 @@ class GroupedSwiGLUExperts(nn.Module):
         *,
         clamp_linear: tuple[float, float] = (-10.0, 10.0),
         clamp_gate_max: float = 10.0,
+        linear_quant: GroupedQuantMode = "bf16",
+        fp4_block_size: int = 32,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -99,6 +110,8 @@ class GroupedSwiGLUExperts(nn.Module):
         self.n_experts = n_experts
         self.clamp_linear = clamp_linear
         self.clamp_gate_max = clamp_gate_max
+        self.linear_quant = linear_quant
+        self.fp4_block_size = fp4_block_size
 
         factory_kwargs: dict[str, Any] = {}
         if device is not None:
@@ -121,6 +134,25 @@ class GroupedSwiGLUExperts(nn.Module):
         for w in (self.gate_weight, self.up_weight, self.down_weight):
             for e in range(self.n_experts):
                 nn.init.kaiming_uniform_(w[e], a=5.0**0.5)
+
+    def _maybe_quant_act(self, x: Tensor) -> Tensor:
+        if self.linear_quant == "fp8":
+            return fake_quant_fp8(x, fmt=Fp8Format.E4M3, axis=0)
+        if self.linear_quant == "fp4":
+            return fake_quant_fp4_mx(x, block_size=self.fp4_block_size, axis=-1)
+        return x
+
+    def _maybe_quant_weight(self, w: Tensor) -> Tensor:
+        """Per-(expert, output-channel) fake quant on (E, out, in) stacked weight."""
+        if self.linear_quant == "bf16":
+            return w
+        e, out, _ = w.shape
+        flat = w.reshape(e * out, -1)
+        if self.linear_quant == "fp8":
+            quantized = fake_quant_fp8(flat, fmt=Fp8Format.E4M3, axis=0)
+        else:  # fp4
+            quantized = fake_quant_fp4_mx(flat, block_size=self.fp4_block_size, axis=-1)
+        return quantized.reshape(w.shape)
 
     def forward(
         self,
@@ -160,18 +192,20 @@ class GroupedSwiGLUExperts(nn.Module):
         bincount = torch.bincount(expert_id, minlength=self.n_experts)
         offsets = torch.cumsum(bincount, dim=0).to(torch.int32)
 
-        # 4) Three grouped matmuls.
+        # 4) Optional fake-quant (STE on backward) + three grouped matmuls.
         # Stacked weights are (n_experts, out, in); _grouped_mm expects (n_experts, in, out).
-        gate_w = self.gate_weight.transpose(1, 2).contiguous()  # (E, K, intermediate)
-        up_w = self.up_weight.transpose(1, 2).contiguous()      # (E, K, intermediate)
-        down_w = self.down_weight.transpose(1, 2).contiguous()  # (E, intermediate, K)
+        gate_w = self._maybe_quant_weight(self.gate_weight).transpose(1, 2).contiguous()
+        up_w = self._maybe_quant_weight(self.up_weight).transpose(1, 2).contiguous()
+        down_w = self._maybe_quant_weight(self.down_weight).transpose(1, 2).contiguous()
 
-        gate_out = grouped_mm(token_sorted, gate_w, offsets).clamp(max=self.clamp_gate_max)
-        up_out = grouped_mm(token_sorted, up_w, offsets).clamp(
+        token_sorted_q = self._maybe_quant_act(token_sorted)
+        gate_out = grouped_mm(token_sorted_q, gate_w, offsets).clamp(max=self.clamp_gate_max)
+        up_out = grouped_mm(token_sorted_q, up_w, offsets).clamp(
             min=self.clamp_linear[0], max=self.clamp_linear[1],
         )
         hidden = F.silu(gate_out) * up_out  # (M*top_k, intermediate)
-        expert_out = grouped_mm(hidden, down_w, offsets)  # (M*top_k, K)
+        hidden_q = self._maybe_quant_act(hidden)
+        expert_out = grouped_mm(hidden_q, down_w, offsets)  # (M*top_k, K)
 
         # 5) Multiply by gate weights and scatter-add back to (M, K).
         weighted = expert_out * gate_sorted.unsqueeze(-1)

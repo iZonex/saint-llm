@@ -14,7 +14,6 @@ Per-iteration update: M ← a M + b (M M^T) M + c (M M^T)^2 M.
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor
 
 

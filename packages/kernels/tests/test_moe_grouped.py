@@ -117,6 +117,57 @@ def test_grouped_swiglu_gradient_flows() -> None:
         assert p.grad is not None and torch.isfinite(p.grad).all()
 
 
+def test_grouped_swiglu_fp8_qat_changes_output_but_stays_finite() -> None:
+    """FP8 fake-quant injects noise; output should differ from bf16 but remain finite."""
+    torch.manual_seed(3)
+    common_kwargs = dict(hidden_dim=32, intermediate_dim=64, n_experts=4)
+    pool_bf16 = GroupedSwiGLUExperts(**common_kwargs, linear_quant="bf16")
+    pool_fp8 = GroupedSwiGLUExperts(**common_kwargs, linear_quant="fp8")
+    pool_fp8.load_state_dict(pool_bf16.state_dict())
+
+    flat_h = torch.randn(8, 32)
+    flat_idx = torch.randint(0, 4, (8, 2))
+    flat_gate = torch.softmax(torch.randn(8, 2), dim=-1)
+    out_bf16 = pool_bf16(flat_h, flat_idx, flat_gate)
+    out_fp8 = pool_fp8(flat_h, flat_idx, flat_gate)
+    assert torch.isfinite(out_fp8).all()
+    assert not torch.equal(out_bf16, out_fp8)
+
+
+def test_grouped_swiglu_fp4_qat_changes_output_but_stays_finite() -> None:
+    torch.manual_seed(4)
+    common_kwargs = dict(hidden_dim=32, intermediate_dim=64, n_experts=4)
+    pool_bf16 = GroupedSwiGLUExperts(**common_kwargs, linear_quant="bf16")
+    pool_fp4 = GroupedSwiGLUExperts(**common_kwargs, linear_quant="fp4", fp4_block_size=32)
+    pool_fp4.load_state_dict(pool_bf16.state_dict())
+
+    flat_h = torch.randn(8, 32)
+    flat_idx = torch.randint(0, 4, (8, 2))
+    flat_gate = torch.softmax(torch.randn(8, 2), dim=-1)
+    out_bf16 = pool_bf16(flat_h, flat_idx, flat_gate)
+    out_fp4 = pool_fp4(flat_h, flat_idx, flat_gate)
+    assert torch.isfinite(out_fp4).all()
+    assert not torch.equal(out_bf16, out_fp4)
+
+
+@pytest.mark.parametrize("mode", ["fp8", "fp4"])
+def test_grouped_swiglu_quant_passes_gradient_through(mode: str) -> None:
+    """STE: backward must yield finite grads on weights and inputs even under quant."""
+    torch.manual_seed(5)
+    pool = GroupedSwiGLUExperts(
+        hidden_dim=32, intermediate_dim=64, n_experts=4,
+        linear_quant=mode, fp4_block_size=32,
+    )
+    flat_h = torch.randn(8, 32, requires_grad=True)
+    flat_idx = torch.randint(0, 4, (8, 2))
+    flat_gate = torch.softmax(torch.randn(8, 2, requires_grad=True), dim=-1)
+    out = pool(flat_h, flat_idx, flat_gate)
+    out.sum().backward()
+    assert flat_h.grad is not None and torch.isfinite(flat_h.grad).all()
+    for p in (pool.gate_weight, pool.up_weight, pool.down_weight):
+        assert p.grad is not None and torch.isfinite(p.grad).all()
+
+
 def test_grouped_swiglu_handles_unused_expert() -> None:
     """If a routing pass picks no token for some expert, that expert contributes 0."""
     pool = GroupedSwiGLUExperts(hidden_dim=8, intermediate_dim=16, n_experts=4)

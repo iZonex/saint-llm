@@ -127,6 +127,8 @@ class DeepSeekMoE(nn.Module):
         *,
         linear_factory: LinearFactory = _default_linear,
         use_grouped_gemm: bool = False,
+        grouped_quant: str = "bf16",
+        fp4_block_size: int = 32,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -150,7 +152,10 @@ class DeepSeekMoE(nn.Module):
         # full precision; fp8/fp4 grouped GEMM is reserved for a follow-up.
         self.grouped_experts: nn.Module | None
         if use_grouped_gemm:
+            from typing import cast
+
             from saint_llm_kernels import GroupedSwiGLUExperts
+            from saint_llm_kernels.moe_grouped import GroupedQuantMode
 
             self.grouped_experts = GroupedSwiGLUExperts(
                 hidden_dim=hidden_dim,
@@ -158,6 +163,8 @@ class DeepSeekMoE(nn.Module):
                 n_experts=cfg.routed_experts,
                 clamp_linear=cfg.swiglu_clamp_linear,
                 clamp_gate_max=cfg.swiglu_clamp_gate_max,
+                linear_quant=cast(GroupedQuantMode, grouped_quant),
+                fp4_block_size=fp4_block_size,
             )
             self.routed_experts = nn.ModuleList()
         else:

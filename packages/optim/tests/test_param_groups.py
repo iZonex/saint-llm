@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import torch
-from torch import nn
-
 from saint_llm_optim import split_for_muon_adamw
+from torch import nn
 
 
 def test_basic_split_disjoint_and_complete() -> None:
