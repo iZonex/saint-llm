@@ -93,31 +93,41 @@ def test_topk_clamps_to_n_blocks() -> None:
     assert out.shape[-1] == 2
 
 
-def test_topk_respects_causal_mask_when_enough_valid_blocks() -> None:
-    """When valid_count ≥ top_k, every pick must be causally valid.
-
-    Caveat: when valid_count < top_k, ``torch.topk`` over an all-(-inf)-tail
-    returns arbitrary indices among the masked entries. That is a pre-existing
-    behavior of the LightningIndexer (the kernel reproduces it bit-for-bit);
-    the fix belongs in core (mask -1 on padded picks). Tracked for follow-up.
-    """
+def test_topk_respects_causal_mask_at_every_position() -> None:
+    """Every non-padded pick (≥ 0) must be causally valid; padded picks are -1."""
     n_blocks = 8
     block_size_m = 4
-    t = 64  # plenty of valid blocks for most positions
-    top_k = 3
+    t = 32
+    top_k = 4
     q, k, w = _random_inputs(t=t, n_blocks=n_blocks)
     out = lightning_indexer_topk_reference(q, k, w, top_k=top_k, block_size_m=block_size_m)
     for t_pos in range(t):
         valid_count = sum(
             1 for s in range(n_blocks) if s * block_size_m + (block_size_m - 1) < t_pos
         )
-        if valid_count < top_k:
-            continue
-        for s_idx in out[0, t_pos].tolist():
+        non_padded = [i for i in out[0, t_pos].tolist() if i >= 0]
+        assert len(non_padded) == min(top_k, valid_count), (
+            f"position {t_pos}: expected {min(top_k, valid_count)} non-padded picks, got {len(non_padded)}"
+        )
+        for s_idx in non_padded:
             block_end = s_idx * block_size_m + (block_size_m - 1)
             assert block_end < t_pos, (
                 f"position {t_pos} picked block {s_idx} (end={block_end}); causal violation"
             )
+
+
+def test_topk_pads_with_minus_one_when_valid_count_below_top_k() -> None:
+    """At early positions where fewer valid blocks exist than top_k, tail = -1."""
+    n_blocks = 8
+    block_size_m = 4
+    top_k = 5
+    q, k, w = _random_inputs(t=8, n_blocks=n_blocks)
+    out = lightning_indexer_topk_reference(q, k, w, top_k=top_k, block_size_m=block_size_m)
+    # Position 0: no completed blocks → all picks should be -1.
+    assert (out[0, 0] == -1).all()
+    # Position 4: block 0 (covers 0..3) is complete → exactly 1 valid, 4 padded.
+    assert (out[0, 4] == -1).sum().item() == 4
+    assert (out[0, 4] >= 0).sum().item() == 1
 
 
 def test_topk_zero_n_blocks_returns_empty() -> None:
@@ -176,7 +186,9 @@ def test_dispatch_uses_compiled_path_on_cuda() -> None:
 
     expected_topk = lightning_indexer_topk_reference(q, k, w, top_k=3, block_size_m=4)
     actual_topk = lightning_indexer_topk(q, k, w, top_k=3, block_size_m=4)
-    # topk with potential ties may differ in tie-broken indices; compare scores at picked indices instead.
-    picked_expected = torch.gather(expected_scores, -1, expected_topk)
-    picked_actual = torch.gather(expected_scores, -1, actual_topk)
-    assert torch.allclose(picked_expected, picked_actual, atol=1.0e-4)
+    # topk with potential ties may differ in tie-broken indices; compare per-position
+    # picks as sets. -1 padding must match exactly (count of padded picks).
+    assert expected_topk.shape == actual_topk.shape
+    for b in range(expected_topk.shape[0]):
+        for t_pos in range(expected_topk.shape[1]):
+            assert sorted(expected_topk[b, t_pos].tolist()) == sorted(actual_topk[b, t_pos].tolist())

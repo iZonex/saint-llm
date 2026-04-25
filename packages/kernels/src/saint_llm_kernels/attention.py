@@ -67,8 +67,10 @@ def lightning_indexer_topk_reference(
 ) -> Tensor:
     """Eager reference. Returns (B, T, k_eff) top-k block indices.
 
-    ``k_eff = min(top_k, n_blocks)``. Returns shape ``(B, T, 0)`` of dtype int64
-    when no compressed blocks exist.
+    ``k_eff = min(top_k, n_blocks)``. Picks where the masked score is ``-inf``
+    (i.e. no valid block exists at that rank for this query position) are
+    returned as ``-1`` so callers can drop them. Returns shape ``(B, T, 0)`` of
+    dtype int64 when no compressed blocks exist.
     """
     b, t, _, _ = q_indexer.shape
     n_blocks = k_compressed.shape[1]
@@ -81,8 +83,9 @@ def lightning_indexer_topk_reference(
     valid = _causal_block_mask(t, n_blocks, block_size_m, q_indexer.device)
     masked = scores.masked_fill(~valid, float("-inf"))
     k_eff = min(top_k, n_blocks)
-    _, top_idx = masked.topk(k_eff, dim=-1)
-    return top_idx
+    top_scores, top_idx = masked.topk(k_eff, dim=-1)
+    valid_pick = torch.isfinite(top_scores)
+    return torch.where(valid_pick, top_idx, top_idx.new_full((), -1))
 
 
 @cache

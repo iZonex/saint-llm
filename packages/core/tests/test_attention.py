@@ -87,3 +87,35 @@ def test_swa_strict_causality() -> None:
     # Positions before 8 should be identical.
     diff = (o1[0, :8] - o2[0, :8]).abs().max().item()
     assert diff < 1.0e-4, f"Causality violated: max diff at positions <8 = {diff}"
+
+
+def test_csa_strict_causality() -> None:
+    """Regression: indexer used to pick causally-future blocks via -inf-tail topk
+    when valid_count < top_k. Mutating a future position must not leak back."""
+    cfg = ModelConfig.tiny()
+    csa = CSA(cfg.hidden_dim, cfg.attention, cfg.csa)
+    csa.eval()
+    t = _seq_len_aligned_to_compression(cfg)
+    h1 = torch.randn(1, t, cfg.hidden_dim)
+    mutate_at = t - 2
+    h2 = h1.clone()
+    h2[0, mutate_at] += 5.0
+    with torch.no_grad():
+        o1 = csa(h1)
+        o2 = csa(h2)
+    diff = (o1[0, :mutate_at] - o2[0, :mutate_at]).abs().max().item()
+    assert diff < 1.0e-4, f"CSA causality violated: max diff at positions <{mutate_at} = {diff}"
+    assert torch.isfinite(o1).all()
+
+
+def test_csa_no_nan_at_zero_position() -> None:
+    """Position 0 has no completed compressed blocks → all indexer picks are -1.
+    Sparse attention must safely produce 0 contribution (not NaN)."""
+    cfg = ModelConfig.tiny()
+    csa = CSA(cfg.hidden_dim, cfg.attention, cfg.csa)
+    csa.eval()
+    t = _seq_len_aligned_to_compression(cfg)
+    h = torch.randn(2, t, cfg.hidden_dim)
+    with torch.no_grad():
+        out = csa(h)
+    assert torch.isfinite(out).all()

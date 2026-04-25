@@ -137,7 +137,12 @@ class LightningIndexer(nn.Module):
         k = min(self.top_k, n_blocks)
         if k == 0:
             return k_indexer_comp, h.new_full((b, t, 0), -1, dtype=torch.long)
-        _, top_idx = scores.topk(k, dim=-1)
+        top_scores, top_idx = scores.topk(k, dim=-1)
+        # Picks where the score is -inf were padded over the causal mask — mark
+        # with -1 so downstream sparse attention can drop them (instead of
+        # gathering from a causally-future block).
+        valid = torch.isfinite(top_scores)
+        top_idx = torch.where(valid, top_idx, top_idx.new_full((), -1))
         return k_indexer_comp, top_idx
 
 
@@ -227,6 +232,7 @@ class CSA(nn.Module):
         n_blocks = compressed_kv.shape[1]
         top_k = top_idx.shape[-1]
 
+        valid_pick = top_idx >= 0  # (B, T, top_k) — false where indexer padded a causally-invalid slot
         if n_blocks > 0 and top_k > 0:
             top_idx_clamped = top_idx.clamp(min=0)
             gather_idx = top_idx_clamped.unsqueeze(-1).expand(-1, -1, -1, self.attn_cfg.head_dim)
@@ -255,13 +261,23 @@ class CSA(nn.Module):
         n_heads = self.attn_cfg.query_heads
         sparse_attn_out = q.new_zeros(b, n_heads, t, self.attn_cfg.head_dim)
         if sparse_kv.shape[-2] > 0:
-            # Per-query attention over its own selected compressed KV (no causal mask needed — top-k already enforced causal).
+            # Per-query attention over its own selected compressed KV. top-k is
+            # causal *only when valid_pick is true*; padded picks must be masked.
             q_for_sparse = q.transpose(1, 2).unsqueeze(-2)  # (B, T, n_heads, 1, head_dim)
             k_for_sparse = sparse_kv.unsqueeze(2).expand(b, t, n_heads, sparse_kv.shape[-2], self.attn_cfg.head_dim)
             v_for_sparse = k_for_sparse  # MQA: shared K and V
-            scores = (q_for_sparse * k_for_sparse).sum(-1) / (self.attn_cfg.head_dim ** 0.5)
-            probs = torch.softmax(scores, dim=-1)
-            sparse_attn_out = (probs.unsqueeze(-1) * v_for_sparse).sum(-2).transpose(1, 2)
+            attn_scores = (q_for_sparse * k_for_sparse).sum(-1) / (self.attn_cfg.head_dim ** 0.5)
+            # Mask padded picks; broadcast valid_pick (B, T, top_k) over heads.
+            attn_scores = attn_scores.masked_fill(~valid_pick.unsqueeze(2), float("-inf"))
+            # Safe-softmax: a query with zero valid picks has all -inf scores;
+            # softmax would NaN. Replace such rows with zeros pre-softmax, then
+            # zero the row's contribution post-mix.
+            row_has_pick = valid_pick.any(dim=-1, keepdim=True).unsqueeze(2)  # (B, T, 1, 1)
+            attn_scores = torch.where(row_has_pick, attn_scores, torch.zeros_like(attn_scores))
+            probs = torch.softmax(attn_scores, dim=-1)
+            mixed = (probs.unsqueeze(-1) * v_for_sparse).sum(-2)  # (B, T, n_heads, head_dim)
+            mixed = torch.where(row_has_pick, mixed, torch.zeros_like(mixed))
+            sparse_attn_out = mixed.transpose(1, 2)
 
         sw_k_h = sw_k.unsqueeze(1).expand(b, n_heads, t, self.attn_cfg.head_dim)
         sw_v_h = sw_v.unsqueeze(1).expand(b, n_heads, t, self.attn_cfg.head_dim)

@@ -51,12 +51,12 @@ def test_kernel_scores_match_indexer_internals(t: int) -> None:
     assert torch.allclose(kernel_scores, canonical_scores, atol=1.0e-6)
 
 
-def test_kernel_topk_matches_indexer_when_unpadded() -> None:
-    """For positions where valid_count ≥ top_k, kernel topk == indexer topk."""
+def test_kernel_topk_matches_indexer_at_every_position() -> None:
+    """Kernel topk matches core indexer topk as sets, including -1 padding tail."""
     block_size_m = 4
     top_k = 3
     n_blocks = 16
-    t = n_blocks * block_size_m  # 64; positions ≥ top_k*m have ≥ top_k valid blocks
+    t = n_blocks * block_size_m  # 64
     indexer = _build_indexer(top_k=top_k, block_size_m=block_size_m)
     indexer.eval()
 
@@ -71,8 +71,11 @@ def test_kernel_topk_matches_indexer_when_unpadded() -> None:
         )
 
     assert idx_kernel.shape == idx_indexer.shape
-    # Positions with ≥ top_k valid blocks: t_pos > (top_k - 1) * block_size_m + (block_size_m - 1)
-    threshold = (top_k - 1) * block_size_m + block_size_m
-    for t_pos in range(threshold, t):
-        # Compare as sets — topk order may differ on numerical ties; sets are stable.
-        assert set(idx_kernel[0, t_pos].tolist()) == set(idx_indexer[0, t_pos].tolist())
+    # Compare as sets — topk order may differ on numerical ties; -1 padding
+    # behavior must match (count of -1 per row identical).
+    for t_pos in range(t):
+        kernel_picks = sorted(idx_kernel[0, t_pos].tolist())
+        indexer_picks = sorted(idx_indexer[0, t_pos].tolist())
+        assert kernel_picks == indexer_picks, (
+            f"position {t_pos}: kernel={kernel_picks} indexer={indexer_picks}"
+        )
