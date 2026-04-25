@@ -154,6 +154,64 @@ class ModelConfig(BaseModel):
         )
 
     @classmethod
+    def small_flash(cls) -> ModelConfig:
+        """First-real-training config — ~150M params, fits 12 GB hpomen Ada.
+
+        Designed for the v0.1 "does the architecture train at scale?" milestone:
+        validate loss curve shape and basic generation quality on a meaningful
+        corpus (FineWeb-Edu sample) before committing to a multi-GPU run.
+
+        Sizing rationale:
+        * vocab=32768 — matches a tokenizer trainable on a few-GB sample.
+        * hidden_dim=768, head_dim=64, query_heads=12 — GPT-2 small footprint.
+        * 8 layers, each (CSA/HCA + MoE) — keeps depth modest for hpomen latency.
+        * 4 routed experts at 1536 intermediate, top-2 routing — keeps MoE
+          parameter count below the embedding budget.
+        * All in_features that go through fp4 quant are multiples of 32.
+        """
+        return cls(
+            variant="flash",
+            n_layers=8,
+            hidden_dim=768,
+            vocab_size=32_768,
+            first_dense_swa_layers=1,
+            csa=CSAConfig(
+                compression_rate=4,
+                indexer_query_heads=4,
+                indexer_head_dim=64,
+                attention_top_k=64,
+            ),
+            hca=HCAConfig(compression_rate=64),
+            attention=AttentionConfig(
+                query_heads=12,
+                head_dim=64,
+                query_compression_dim=512,
+                output_proj_groups=4,
+                attention_intermediate_dim=192,
+                sliding_window_size=128,
+                rope_dim=32,
+            ),
+            moe=MoEConfig(
+                hash_routed_layers=2,
+                shared_experts=1,
+                routed_experts=4,
+                experts_per_token=2,
+                expert_intermediate_dim=1536,
+            ),
+            mhc=MHCConfig(expansion_factor=2, sinkhorn_iters=8),
+            tokenizer_slots=TokenizerSlots(
+                image_pad=32500,
+                audio_start=32501,
+                audio_end=32505,
+                video_start=32506,
+                video_end=32507,
+                think_start=32508,
+                think_end=32509,
+                memory_block_base=32510,
+            ),
+        )
+
+    @classmethod
     def tiny(cls) -> ModelConfig:
         """Test-friendly config — fits on CPU/MPS, vocab=512 with slots remapped to fit."""
         return cls(
