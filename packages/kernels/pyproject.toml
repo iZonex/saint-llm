@@ -1,0 +1,21 @@
+[project]
+name = "saint-llm-kernels"
+version = "0.0.1"
+description = "Saint LLM kernels: TileLang fused ops, MegaMoE, batch-invariant deterministic kernels"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.5",
+]
+
+[project.optional-dependencies]
+cuda = [
+    "triton>=3.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/saint_llm_kernels"]

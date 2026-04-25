@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.installed.cfg
+*.egg
+build/
+dist/
+wheels/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# uv
+uv.lock
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Testing / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ML artifacts
+checkpoints/
+runs/
+wandb/
+mlruns/
+outputs/
+logs/
+*.pt
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+
+# Data (do not commit datasets)
+data/raw/
+data/processed/
+data/interim/
+*.parquet
+*.arrow
+*.tfrecord
+
+# Hydra
+multirun/
+.hydra/
+
+# Rust (DSec)
+target/
+Cargo.lock
+
+# Local config
+.env
+.env.local
+*.local
+
+# Compiled extensions
+*.cu.o
+*.cubin
+*.ptx

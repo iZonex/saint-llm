@@ -1,0 +1,16 @@
+[project]
+name = "saint-llm-distributed"
+version = "0.0.1"
+description = "Saint LLM distributed: fine-grained EP, hybrid ZeRO, two-stage CP, DualPipe"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+dependencies = [
+    "torch>=2.5",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/saint_llm_distributed"]

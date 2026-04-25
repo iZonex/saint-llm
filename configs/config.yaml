@@ -1,0 +1,22 @@
+# Saint LLM root Hydra config
+defaults:
+  - model: v4_flash
+  - training: pretrain
+  - data: web_default
+  - _self_
+
+# Run-level
+run_name: ???
+seed: 1337
+output_dir: outputs/${run_name}
+
+# Hardware
+device: cuda
+dtype: bfloat16
+compile: true
+
+hydra:
+  run:
+    dir: ${output_dir}
+  job:
+    chdir: false

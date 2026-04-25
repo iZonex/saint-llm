@@ -1,0 +1,85 @@
+[project]
+name = "saint-llm"
+version = "0.0.1"
+description = "Saint LLM — DeepSeek-V4-style training and inference framework"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Dmytro Chystiakov", email = "dlchistyakov@gmail.com" }]
+
+dependencies = [
+    "saint-llm-core",
+    "saint-llm-kernels",
+    "saint-llm-optim",
+    "saint-llm-distributed",
+    "saint-llm-training",
+    "saint-llm-posttraining",
+    "saint-llm-inference",
+    "saint-llm-data",
+    "saint-llm-eval",
+]
+
+[tool.uv.workspace]
+members = ["packages/*"]
+
+[tool.uv.sources]
+saint-llm-core = { workspace = true }
+saint-llm-kernels = { workspace = true }
+saint-llm-optim = { workspace = true }
+saint-llm-distributed = { workspace = true }
+saint-llm-training = { workspace = true }
+saint-llm-posttraining = { workspace = true }
+saint-llm-inference = { workspace = true }
+saint-llm-data = { workspace = true }
+saint-llm-eval = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "ruff>=0.7",
+    "mypy>=1.13",
+    "pytest>=8.3",
+    "pytest-xdist>=3.6",
+    "pytest-cov>=5",
+    "pre-commit>=4",
+    "ipython>=8",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["third_party", ".venv", "build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PL", "PERF", "NPY", "PD"]
+ignore = ["E501", "PLR0913", "PLR2004", "PLR0912", "PLR0915"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["PLR2004", "S101"]
+"**/__init__.py" = ["F401", "F403"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_return_any = true
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["torch.*", "tilelang.*", "deepgemm.*", "flash_attn.*", "triton.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+addopts = "-ra -q --strict-markers --strict-config"
+testpaths = ["tests", "packages/*/tests"]
+markers = [
+    "slow: slow tests (deselect with '-m \"not slow\"')",
+    "gpu: requires GPU",
+    "distributed: requires multi-node setup",
+    "fp4: requires FP4-capable hardware (Blackwell)",
+]

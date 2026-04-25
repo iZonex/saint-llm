@@ -1,0 +1,50 @@
+# DeepSeek-V4-Flash architecture config
+# Section 4.2.1 of DeepSeek_V4.pdf
+_target_: saint_llm_core.config.ModelConfig
+
+variant: flash
+n_layers: 43
+hidden_dim: 4096
+vocab_size: 128000
+
+# Attention layout
+first_dense_swa_layers: 2  # First 2 layers: pure sliding window attention
+attention_pattern: csa_hca_interleaved  # Subsequent layers: CSA/HCA interleaved
+
+# CSA
+csa:
+  compression_rate: 4              # m
+  indexer_query_heads: 64          # n_h^I
+  indexer_head_dim: 128            # c^I
+  attention_top_k: 512             # KV entries selected for sparse attention
+
+# HCA
+hca:
+  compression_rate: 128            # m'
+
+# Shared CSA/HCA
+attention:
+  query_heads: 64                  # n_h
+  head_dim: 512                    # c
+  query_compression_dim: 1024      # d_c
+  output_proj_groups: 8            # g
+  attention_intermediate_dim: 1024 # d_g
+  sliding_window_size: 128         # n_win
+  rope_dim: 64                     # last 64 dims of head get RoPE
+
+# MoE
+moe:
+  hash_routed_layers: 3            # First 3 MoE layers use hash routing
+  shared_experts: 1
+  routed_experts: 256
+  experts_per_token: 6
+  expert_intermediate_dim: 2048
+  affinity_fn: sqrt_softplus       # V4 uses sqrt(softplus(x)), not sigmoid
+
+# MTP
+mtp_depth: 1
+
+# mHC
+mhc:
+  expansion_factor: 4              # n_hc
+  sinkhorn_iters: 20               # t_max

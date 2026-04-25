@@ -1,0 +1,43 @@
+# DeepSeek-V4-Pro architecture config
+# Section 4.2.1 of DeepSeek_V4.pdf
+_target_: saint_llm_core.config.ModelConfig
+
+variant: pro
+n_layers: 61
+hidden_dim: 7168
+vocab_size: 128000
+
+first_dense_swa_layers: 2
+attention_pattern: csa_hca_interleaved
+
+csa:
+  compression_rate: 4
+  indexer_query_heads: 64
+  indexer_head_dim: 128
+  attention_top_k: 1024
+
+hca:
+  compression_rate: 128
+
+attention:
+  query_heads: 128
+  head_dim: 512
+  query_compression_dim: 1536
+  output_proj_groups: 16
+  attention_intermediate_dim: 1024
+  sliding_window_size: 128
+  rope_dim: 64
+
+moe:
+  hash_routed_layers: 3
+  shared_experts: 1
+  routed_experts: 384
+  experts_per_token: 6
+  expert_intermediate_dim: 3072
+  affinity_fn: sqrt_softplus
+
+mtp_depth: 1
+
+mhc:
+  expansion_factor: 4
+  sinkhorn_iters: 20

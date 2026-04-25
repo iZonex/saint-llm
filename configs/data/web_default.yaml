@@ -1,0 +1,18 @@
+# Default web pretraining data mix (placeholder; refine in data pipeline task)
+_target_: saint_llm_data.config.DataConfig
+
+sources:
+  - name: web
+    weight: 0.45
+  - name: code
+    weight: 0.20
+  - name: math
+    weight: 0.10
+  - name: long_doc
+    weight: 0.15
+  - name: multilingual
+    weight: 0.10
+
+tokenizer_path: tokenizers/saint_v1
+sample_attention_mask: true
+fim_pack: true
