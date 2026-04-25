@@ -73,9 +73,19 @@ class HCA(nn.Module):
             m = self.hca_cfg.compression_rate
             q_idx = torch.arange(t, device=device).unsqueeze(-1)
             block_end = torch.arange(n_blocks, device=device).unsqueeze(0) * m + (m - 1)
-            valid = (block_end < q_idx).unsqueeze(0).unsqueeze(0).expand(b, n_heads, t, n_blocks)
+            valid_2d = block_end < q_idx  # (T, n_blocks)
+            valid = valid_2d.unsqueeze(0).unsqueeze(0).expand(b, n_heads, t, n_blocks)
             ck = compressed_kv_n.unsqueeze(1).expand(b, n_heads, n_blocks, self.attn_cfg.head_dim)
             compressed_attn_out = scaled_dot_product(q, ck, ck, mask=valid, sink_logit=self.sink_logit)
+            if self.sink_logit is None:
+                # All-(-inf) rows would softmax to NaN. Zero them post-hoc; their
+                # contribution is 0 (no valid block to attend to).
+                row_has_block = valid_2d.any(dim=-1)  # (T,)
+                compressed_attn_out = torch.where(
+                    row_has_block.view(1, 1, t, 1),
+                    compressed_attn_out,
+                    torch.zeros_like(compressed_attn_out),
+                )
 
         # Sliding-window branch
         sw_k = apply_partial_rope(self.k_proj(h).unsqueeze(1), cos, sin, self.attn_cfg.rope_dim).squeeze(1)

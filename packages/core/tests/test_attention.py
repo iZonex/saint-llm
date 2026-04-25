@@ -119,3 +119,35 @@ def test_csa_no_nan_at_zero_position() -> None:
     with torch.no_grad():
         out = csa(h)
     assert torch.isfinite(out).all()
+
+
+def test_hca_strict_causality() -> None:
+    """A change at position t must not affect HCA output at positions < t."""
+    cfg = ModelConfig.tiny()
+    hca = HCA(cfg.hidden_dim, cfg.attention, cfg.hca)
+    hca.eval()
+    t = _seq_len_aligned_to_compression(cfg)
+    h1 = torch.randn(1, t, cfg.hidden_dim)
+    mutate_at = t - 2
+    h2 = h1.clone()
+    h2[0, mutate_at] += 5.0
+    with torch.no_grad():
+        o1 = hca(h1)
+        o2 = hca(h2)
+    diff = (o1[0, :mutate_at] - o2[0, :mutate_at]).abs().max().item()
+    assert diff < 1.0e-4, f"HCA causality violated: max diff at positions <{mutate_at} = {diff}"
+
+
+def test_hca_no_nan_at_zero_position() -> None:
+    """At position 0 no compressed block is valid; with sink disabled, naive
+    softmax over all -inf scores would NaN. Sentinel zero-out prevents it."""
+    cfg = ModelConfig.tiny()
+    # Reuse the model's attention config but force the sink off to exercise the path.
+    attn_cfg = cfg.attention.model_copy(update={"use_attention_sink": False})
+    hca = HCA(cfg.hidden_dim, attn_cfg, cfg.hca)
+    hca.eval()
+    t = _seq_len_aligned_to_compression(cfg)
+    h = torch.randn(2, t, cfg.hidden_dim)
+    with torch.no_grad():
+        out = hca(h)
+    assert torch.isfinite(out).all()
