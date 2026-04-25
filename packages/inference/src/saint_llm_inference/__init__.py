@@ -11,7 +11,12 @@ Modules:
     engine                — Top-level inference engine
 """
 
-from saint_llm_inference.generate import greedy_decode, top_k_sample, top_p_sample
+from saint_llm_inference.generate import (
+    greedy_decode,
+    greedy_decode_cached,
+    top_k_sample,
+    top_p_sample,
+)
 from saint_llm_inference.kv_cache import KVCacheBundle, SWAKVCacheLayer
 
 __version__ = "0.0.1"
@@ -20,6 +25,7 @@ __all__ = [
     "KVCacheBundle",
     "SWAKVCacheLayer",
     "greedy_decode",
+    "greedy_decode_cached",
     "top_k_sample",
     "top_p_sample",
 ]

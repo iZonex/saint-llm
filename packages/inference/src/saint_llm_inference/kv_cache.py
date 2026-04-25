@@ -120,3 +120,39 @@ class KVCacheBundle:
         for layer in self._layers:
             if layer is not None:
                 layer.reset()
+
+    @classmethod
+    def for_model(
+        cls,
+        model: object,
+        *,
+        max_seq_len: int,
+        batch_size: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> KVCacheBundle:
+        """Build a bundle by walking ``model.blocks``.
+
+        Each ``TransformerBlock`` whose ``attention`` is a ``SWAttention``
+        gets its own ``SWAKVCacheLayer``; other attention types get ``None``
+        until stages 3/4 land. ``model`` is duck-typed (must expose
+        ``blocks`` and the head_dim via ``cfg.attention.head_dim``).
+        """
+        # Local import to keep the runtime graph free of saint_llm_core when
+        # this helper isn't used. Avoids a hard dep cycle in tests.
+        from saint_llm_core.attention import SWAttention  # noqa: PLC0415
+
+        head_dim = model.cfg.attention.head_dim  # type: ignore[attr-defined]
+        layers: list[SWAKVCacheLayer | None] = []
+        for block in model.blocks:  # type: ignore[attr-defined]
+            if isinstance(block.attention, SWAttention):
+                layers.append(SWAKVCacheLayer(
+                    max_seq_len=max_seq_len,
+                    head_dim=head_dim,
+                    batch_size=batch_size,
+                    device=device,
+                    dtype=dtype,
+                ))
+            else:
+                layers.append(None)
+        return cls(layers)

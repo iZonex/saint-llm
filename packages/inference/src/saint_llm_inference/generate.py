@@ -1,9 +1,13 @@
-"""Basic decoding loops — greedy, top-k, and top-p (nucleus) sampling.
+"""Decoding loops — greedy / top-k / top-p with optional KV cache.
 
-No KV cache yet: every step recomputes the full forward over the running prompt.
-That's intentional for v0.1 — gets us a working "talk to the model" surface
-without committing to a cache layout. Heterogeneous KV cache (the inference
-package's main remit) layers on top with the same generate() entry points.
+The base loops (``greedy_decode``, ``top_k_sample``, ``top_p_sample``)
+recompute the full forward at every step (O(T^2) total). The
+``_cached`` variants build a ``KVCacheBundle`` once, prefill the prompt
+in a single forward, then decode one token at a time — partial
+support for now: only ``SWAttention`` layers honor the cache; CSA/HCA
+fall back to recompute (stages 3/4). On cfg.tiny / cfg.small_flash with
+``first_dense_swa_layers=1`` the cached path saves the SWA layer's
+forward each step (small but real).
 """
 
 from __future__ import annotations
@@ -11,6 +15,8 @@ from __future__ import annotations
 import torch
 from saint_llm_core.model import SaintLLM
 from torch import Tensor
+
+from saint_llm_inference.kv_cache import KVCacheBundle
 
 
 @torch.no_grad()
@@ -52,6 +58,70 @@ def greedy_decode(
                 pad = max_new_tokens - (tokens.shape[1] - prompt_ids.shape[1])
                 if pad > 0:
                     pad_tensor = next_token.new_full((prompt_ids.shape[0], pad), eos_token)
+                    tokens = torch.cat([tokens, pad_tensor], dim=-1)
+                break
+    return tokens
+
+
+@torch.no_grad()
+def greedy_decode_cached(
+    model: SaintLLM,
+    prompt_ids: Tensor,
+    *,
+    max_new_tokens: int,
+    eos_token: int | None = None,
+    bundle: KVCacheBundle | None = None,
+) -> Tensor:
+    """Greedy decoding with KV cache. Same contract as ``greedy_decode``.
+
+    Builds a ``KVCacheBundle`` for ``model`` if one isn't supplied (capacity
+    is ``prompt_len + max_new_tokens``). Prefill runs the full prompt in one
+    forward; subsequent steps feed only the most recent token, leaning on
+    the cache for layers that support it.
+    """
+    if prompt_ids.dim() != 2:
+        raise ValueError(f"prompt_ids must be 2D (B, T); got shape {tuple(prompt_ids.shape)}")
+    b, prompt_t = prompt_ids.shape
+    capacity = prompt_t + max_new_tokens
+    if bundle is None:
+        bundle = KVCacheBundle.for_model(
+            model,
+            max_seq_len=capacity,
+            batch_size=b,
+            device=prompt_ids.device,
+        )
+
+    # Prefill.
+    out = model(prompt_ids, kv_cache_bundle=bundle)
+    logits = out["logits"]
+    assert isinstance(logits, Tensor)
+    next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+    tokens = torch.cat([prompt_ids, next_token], dim=-1)
+
+    seen_eos = (
+        torch.zeros(b, dtype=torch.bool, device=prompt_ids.device)
+        if eos_token is None
+        else (next_token.squeeze(-1) == eos_token)
+    )
+    if eos_token is not None and bool(seen_eos.all().item()):
+        pad = max_new_tokens - 1
+        if pad > 0:
+            pad_tensor = next_token.new_full((b, pad), eos_token)
+            tokens = torch.cat([tokens, pad_tensor], dim=-1)
+        return tokens
+
+    for _ in range(max_new_tokens - 1):
+        out = model(tokens[:, -1:], kv_cache_bundle=bundle)
+        logits = out["logits"]
+        assert isinstance(logits, Tensor)
+        next_token = logits[:, -1, :].argmax(dim=-1, keepdim=True)
+        tokens = torch.cat([tokens, next_token], dim=-1)
+        if eos_token is not None:
+            seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
+            if bool(seen_eos.all().item()):
+                pad = capacity - tokens.shape[1]
+                if pad > 0:
+                    pad_tensor = next_token.new_full((b, pad), eos_token)
                     tokens = torch.cat([tokens, pad_tensor], dim=-1)
                 break
     return tokens

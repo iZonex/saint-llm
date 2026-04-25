@@ -7,7 +7,12 @@ import torch
 from saint_llm_core.attention import SWAttention
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
-from saint_llm_inference import KVCacheBundle, SWAKVCacheLayer
+from saint_llm_inference import (
+    KVCacheBundle,
+    SWAKVCacheLayer,
+    greedy_decode,
+    greedy_decode_cached,
+)
 
 
 def _swa(cfg: ModelConfig) -> SWAttention:
@@ -231,3 +236,52 @@ def test_saintllm_default_kv_cache_bundle_none_unchanged() -> None:
         a = model(token_ids)["logits"]
         b = model(token_ids, kv_cache_bundle=None)["logits"]
     assert torch.equal(a, b)
+
+
+def test_bundle_for_model_factory() -> None:
+    """Bundle built from a SaintLLM has one entry per block; SWA blocks
+    populated, others None."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg).eval()
+    bundle = KVCacheBundle.for_model(model, max_seq_len=8)
+    assert len(bundle) == cfg.n_layers
+    swa_count = sum(
+        1 for i in range(cfg.n_layers) if bundle.for_layer(i) is not None
+    )
+    # cfg.tiny has first_dense_swa_layers=1.
+    assert swa_count == cfg.first_dense_swa_layers
+
+
+def test_greedy_decode_cached_runs() -> None:
+    """End-to-end: cached greedy decode produces tokens and exits cleanly."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg).eval()
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    out = greedy_decode_cached(model, prompt, max_new_tokens=6)
+    assert out.shape == (1, 10)
+    assert out.dtype == torch.long
+    # Prompt prefix preserved.
+    assert torch.equal(out[:, :4], prompt)
+
+
+def test_greedy_decode_cached_eos_short_circuits() -> None:
+    """When the first emitted token == eos, the loop pads and returns full width."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg).eval()
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    # Find the model's first greedy pick on this prompt; use it as eos.
+    first = greedy_decode(model, prompt, max_new_tokens=1)[0, -1].item()
+    out = greedy_decode_cached(model, prompt, max_new_tokens=8, eos_token=int(first))
+    assert out.shape[-1] == 4 + 8
+    # The eos token occupies the rest of the tail.
+    assert (out[0, 4:] == int(first)).all()
+
+
+def test_greedy_decode_cached_rejects_non_2d() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg).eval()
+    with pytest.raises(ValueError, match="must be 2D"):
+        greedy_decode_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2)
