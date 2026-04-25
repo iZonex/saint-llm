@@ -14,9 +14,9 @@ Status legend: `accepted-v0.1` (in scope), `deferred-v0.2` (slot reserved), `rej
 |---|---|---|---|---|
 | MM-V-01 | Native multimodal pretraining (Gemma 4 / Qwen3-VL / InternVL3 pattern) | `accepted-v0.1` | InternVL3 (arXiv 2504.10479), Qwen3-VL (arXiv 2511.21631), Gemma 4 model card | Only multimodal pattern with frontier validation at >70B. Adapter-only approaches cap capability ceiling. |
 | MM-V-02 | SigLIP-2-SO400M ViT encoder | `accepted-v0.1` | arXiv 2502.14786 | Best 2026 open vision encoder. 400M params, 14×14 patches, native 384/512 res. |
-| MM-V-03 | RoPE-2D for native aspect ratios | `accepted-v0.1` | Pixtral 12B (arXiv 2410.07073), Qwen3-VL | Avoids center-crop quality loss. |
+| MM-V-03 | RoPE-2D for native aspect ratios | `accepted-v0.1` *(impl deferred to v0.1.1 polish — requires SigLIP-2 internal patch)* | Pixtral 12B (arXiv 2410.07073), Qwen3-VL | Avoids center-crop quality loss. |
 | MM-V-04 | DeepStack multi-level feature fusion | `accepted-v0.1` | Qwen3-VL technical report | Lower-level ViT features reach LLM, not just final-layer CLS. |
-| MM-V-05 | Adaptive token budget 64-1280 per image | `accepted-v0.1` | Gemma 4, Qwen3-VL | Quality/throughput trade per image complexity. |
+| MM-V-05 | Adaptive token budget 64-1280 per image | `accepted-v0.1` *(impl deferred to v0.1.1 polish — fixed token count from SigLIP-2 native res for now)* | Gemma 4, Qwen3-VL | Quality/throughput trade per image complexity. |
 | MM-V-06 | is_visual mask propagated into CSA Lightning Indexer positional bias | `accepted-v0.1` | Mitigation for V4 risk — vision tokens cluster spatially | Untested: CSA top-k may over-select or starve on dense vision blocks. Force HCA to always include vision blocks via small gating bias. |
 | MM-V-07 | Stage-2 ViT unfreeze | `accepted-v0.1` | InternVL3 | Recovers capability ceiling without breaking early stability. |
 | MM-V-08 | Janus-Pro-style VQ image-generation head | `deferred-v0.2` | Janus-Pro (CVPR 2025) | Reserved 2,368 vocab slots in 128704-131071 range. Attached without backbone retrain in v0.2. |

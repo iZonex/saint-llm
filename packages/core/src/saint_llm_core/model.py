@@ -140,18 +140,31 @@ class SaintLLM(nn.Module):
         h = self.embed(token_ids)
         if vision_features is not None and self.cfg.multimodal.enable_vision_projector:
             mask = token_ids == self.cfg.tokenizer_slots.image_pad
-            if mask.any():
+            n_slots = int(mask.sum().item())
+            if n_slots > 0:
+                # vision_features: (n_image_tokens_total, vision_input_dim) — caller pre-flattens.
+                if vision_features.shape[0] != n_slots:
+                    raise ValueError(
+                        f"vision_features has {vision_features.shape[0]} rows but token sequence has "
+                        f"{n_slots} <|image_pad|> slots — must match",
+                    )
                 projected = self.vision_proj(vision_features)
                 h = h.clone()
-                h[mask] = projected.reshape(-1, h.shape[-1])[: mask.sum()]
+                h[mask] = projected
         if audio_features is not None and self.cfg.multimodal.enable_audio_projector:
             audio_mask = (token_ids >= self.cfg.tokenizer_slots.audio_start) & (
                 token_ids <= self.cfg.tokenizer_slots.audio_end
             )
-            if audio_mask.any():
+            n_audio = int(audio_mask.sum().item())
+            if n_audio > 0:
+                if audio_features.shape[0] != n_audio:
+                    raise ValueError(
+                        f"audio_features has {audio_features.shape[0]} rows but token sequence has "
+                        f"{n_audio} audio slots — must match",
+                    )
                 projected_a = self.audio_proj(audio_features)
                 h = h.clone()
-                h[audio_mask] = projected_a.reshape(-1, h.shape[-1])[: audio_mask.sum()]
+                h[audio_mask] = projected_a
         return h
 
     def forward(

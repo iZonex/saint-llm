@@ -141,7 +141,7 @@ class ModelConfig(BaseModel):
 
     @classmethod
     def tiny(cls) -> ModelConfig:
-        """Test-friendly config — fits on CPU/MPS."""
+        """Test-friendly config — fits on CPU/MPS, vocab=512 with slots remapped to fit."""
         return cls(
             variant="flash",
             n_layers=4,
@@ -172,4 +172,14 @@ class ModelConfig(BaseModel):
                 expert_intermediate_dim=64,
             ),
             mhc=MHCConfig(expansion_factor=2, sinkhorn_iters=5),
+            tokenizer_slots=TokenizerSlots(
+                image_pad=500,
+                audio_start=501,
+                audio_end=505,
+                video_start=506,
+                video_end=507,
+                think_start=508,
+                think_end=509,
+                memory_block_base=510,
+            ),
         )
