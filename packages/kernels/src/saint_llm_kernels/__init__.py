@@ -8,6 +8,12 @@ Modules:
     quant          — FP4/FP8 cast/dequant kernels
 """
 
+from saint_llm_kernels.attention import (
+    lightning_indexer_scores,
+    lightning_indexer_scores_reference,
+    lightning_indexer_topk,
+    lightning_indexer_topk_reference,
+)
 from saint_llm_kernels.mhc import mhc_carry, mhc_carry_reference
 from saint_llm_kernels.quant import (
     Fp8Format,
@@ -29,6 +35,10 @@ __all__ = [
     "dequant_from_fp8",
     "fake_quant_fp4_mx",
     "fake_quant_fp8",
+    "lightning_indexer_scores",
+    "lightning_indexer_scores_reference",
+    "lightning_indexer_topk",
+    "lightning_indexer_topk_reference",
     "mhc_carry",
     "mhc_carry_reference",
 ]
