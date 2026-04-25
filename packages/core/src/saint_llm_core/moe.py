@@ -10,12 +10,22 @@ SwiGLU clamping per training stability section: linear ∈ [-10,10], gate ≤ 10
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from saint_llm_core.attention.common import RMSNorm
 from saint_llm_core.config import MoEConfig
+
+# A linear-layer factory: ``factory(in_features, out_features, bias=...)`` -> nn.Module.
+# Default is ``nn.Linear``; FP8/FP4 QAT variants live in ``saint_llm_kernels``.
+LinearFactory = Callable[..., nn.Module]
+
+
+def _default_linear(in_features: int, out_features: int, *, bias: bool = True) -> nn.Linear:
+    return nn.Linear(in_features, out_features, bias=bias)
 
 
 class SwiGLU(nn.Module):
@@ -25,11 +35,13 @@ class SwiGLU(nn.Module):
         intermediate_dim: int,
         clamp_linear: tuple[float, float],
         clamp_gate_max: float,
+        *,
+        linear_factory: LinearFactory = _default_linear,
     ) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
-        self.up_proj = nn.Linear(hidden_dim, intermediate_dim, bias=False)
-        self.down_proj = nn.Linear(intermediate_dim, hidden_dim, bias=False)
+        self.gate_proj = linear_factory(hidden_dim, intermediate_dim, bias=False)
+        self.up_proj = linear_factory(hidden_dim, intermediate_dim, bias=False)
+        self.down_proj = linear_factory(intermediate_dim, hidden_dim, bias=False)
         self.clamp_linear = clamp_linear
         self.clamp_gate_max = clamp_gate_max
 
@@ -112,6 +124,8 @@ class DeepSeekMoE(nn.Module):
         cfg: MoEConfig,
         layer_idx: int,
         enable_modality_router_bias: bool = True,
+        *,
+        linear_factory: LinearFactory = _default_linear,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -122,11 +136,19 @@ class DeepSeekMoE(nn.Module):
 
         self.norm = RMSNorm(hidden_dim)
         self.shared_experts = nn.ModuleList(
-            SwiGLU(hidden_dim, cfg.expert_intermediate_dim, cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max)
+            SwiGLU(
+                hidden_dim, cfg.expert_intermediate_dim,
+                cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max,
+                linear_factory=linear_factory,
+            )
             for _ in range(cfg.shared_experts)
         )
         self.routed_experts = nn.ModuleList(
-            SwiGLU(hidden_dim, cfg.expert_intermediate_dim, cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max)
+            SwiGLU(
+                hidden_dim, cfg.expert_intermediate_dim,
+                cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max,
+                linear_factory=linear_factory,
+            )
             for _ in range(cfg.routed_experts)
         )
 
