@@ -2,8 +2,13 @@
 
 ``TextFileDataset`` is the v0.1 workhorse: streams lines (plain text or JSONL
 with a ``text`` field) through a ``Tokenizer`` and yields fixed-shape
-``PackedBatch`` windows ready to feed a training step. Single-process, no
-sharding — multi-worker / multi-rank dataloading lives on top.
+``PackedBatch`` windows ready to feed a training step.
+
+Subclasses ``torch.utils.data.IterableDataset`` with document-level
+sharding: when wrapped in a DataLoader with ``num_workers > 0``, each
+worker handles 1/N of the source documents (round-robin by line index).
+Tokenization happens inside the worker so CPU work parallelizes; only the
+final batched tensors cross the worker boundary.
 """
 
 from __future__ import annotations
@@ -11,6 +16,8 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Iterator
 from pathlib import Path
+
+from torch.utils.data import IterableDataset, get_worker_info
 
 from saint_llm_data.packing import PackedBatch, pack_into_batch
 from saint_llm_data.tokenizer import Tokenizer
@@ -38,7 +45,18 @@ def _iter_text_lines(path: Path, *, jsonl: bool, json_field: str) -> Iterator[st
                 yield line
 
 
-class TextFileDataset:
+def _worker_shard() -> tuple[int, int]:
+    """Return ``(worker_id, num_workers)`` from the current torch DataLoader worker.
+
+    Returns ``(0, 1)`` outside of a DataLoader worker (single-process iteration).
+    """
+    info = get_worker_info()
+    if info is None:
+        return 0, 1
+    return int(info.id), int(info.num_workers)
+
+
+class TextFileDataset(IterableDataset):
     """Iterable dataset that streams text → tokens → packed training batches.
 
     Args:
@@ -66,6 +84,7 @@ class TextFileDataset:
         json_field: str = "text",
         drop_last: bool = True,
     ) -> None:
+        super().__init__()
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
@@ -77,7 +96,11 @@ class TextFileDataset:
         self.drop_last = drop_last
 
     def _iter_token_docs(self) -> Iterable[list[int]]:
-        for text in _iter_text_lines(self.path, jsonl=self.jsonl, json_field=self.json_field):
+        worker_id, num_workers = _worker_shard()
+        lines = _iter_text_lines(self.path, jsonl=self.jsonl, json_field=self.json_field)
+        for i, text in enumerate(lines):
+            if i % num_workers != worker_id:
+                continue
             yield self.tokenizer.encode(text)
 
     def __iter__(self) -> Iterator[PackedBatch]:

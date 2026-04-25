@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 from saint_llm_data import CharTokenizer, TextFileDataset
+from torch.utils.data import DataLoader
 
 
 def _write(path: Path, lines: list[str]) -> Path:
@@ -114,3 +115,38 @@ def test_text_file_dataset_iterates_fresh_each_loop(tmp_path: Path) -> None:
     # Both passes should yield the same content.
     assert len(first) == len(second)
     assert (first[0].tokens == second[0].tokens).all()
+
+
+def test_text_file_dataset_works_in_dataloader(tmp_path: Path) -> None:
+    """Wrap in torch DataLoader (num_workers=0) — round-trip the windows."""
+    file_path = _write(tmp_path / "loader.txt", ["alpha", "beta", "gamma"])
+    tok = CharTokenizer()
+    ds = TextFileDataset(file_path, tokenizer=tok, seq_len=8, drop_last=False)
+    loader = DataLoader(ds, batch_size=None, num_workers=0)
+    batches = list(loader)
+    assert len(batches) >= 1
+
+
+def test_text_file_dataset_multi_worker_full_coverage(tmp_path: Path) -> None:
+    """With 2 workers, the union of yielded windows must cover every line."""
+    docs = [f"document number {i}" for i in range(20)]
+    file_path = _write(tmp_path / "many.txt", docs)
+    tok = CharTokenizer()
+    # batch_size=None so each yielded item is the dataset's own PackedBatch.
+    ds = TextFileDataset(
+        file_path, tokenizer=tok, seq_len=128, batch_size=1, drop_last=False,
+    )
+    single = DataLoader(ds, batch_size=None, num_workers=0)
+    multi = DataLoader(ds, batch_size=None, num_workers=2)
+
+    def collect_eos_count(loader: DataLoader) -> int:
+        total = 0
+        for batch in loader:
+            total += int((batch.tokens == tok.eos_token_id).sum().item())
+        return total
+
+    eos_single = collect_eos_count(single)
+    eos_multi = collect_eos_count(multi)
+    # Both passes should observe exactly one EOS per source document — total 20.
+    assert eos_single == 20
+    assert eos_multi == 20

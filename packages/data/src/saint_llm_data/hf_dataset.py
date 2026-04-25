@@ -5,6 +5,12 @@ field through a ``Tokenizer`` and yields ``PackedBatch`` windows ready for the
 training loop. ``streaming=True`` by default — for any non-trivial corpus we
 do *not* want to download the whole thing locally.
 
+Subclasses ``torch.utils.data.IterableDataset`` with row-level worker
+sharding: under a DataLoader with ``num_workers > 0`` each worker tokenizes
+1/N of the source rows (round-robin by row index). For HF's own
+``IterableDataset.shard``, prefer ``load_dataset_kwargs`` to handle
+that upstream where supported.
+
 For local files use ``TextFileDataset`` instead — same output contract.
 """
 
@@ -14,12 +20,14 @@ from collections.abc import Iterable, Iterator
 from typing import Any
 
 from datasets import load_dataset
+from torch.utils.data import IterableDataset
 
+from saint_llm_data.dataset import _worker_shard
 from saint_llm_data.packing import PackedBatch, pack_into_batch
 from saint_llm_data.tokenizer import Tokenizer
 
 
-class HuggingFaceTextDataset:
+class HuggingFaceTextDataset(IterableDataset):
     """Iterable HF-Hub-backed dataset producing ``PackedBatch`` windows.
 
     Args:
@@ -52,6 +60,7 @@ class HuggingFaceTextDataset:
         drop_last: bool = True,
         load_dataset_kwargs: dict[str, Any] | None = None,
     ) -> None:
+        super().__init__()
         self.path = path
         self.tokenizer = tokenizer
         self.seq_len = seq_len
@@ -74,7 +83,10 @@ class HuggingFaceTextDataset:
         return load_dataset(self.path, **kwargs)
 
     def _iter_token_docs(self) -> Iterable[list[int]]:
-        for row in self._open():
+        worker_id, num_workers = _worker_shard()
+        for i, row in enumerate(self._open()):
+            if i % num_workers != worker_id:
+                continue
             if self.text_field not in row:
                 raise KeyError(
                     f"row missing field {self.text_field!r}; got keys {sorted(row.keys())}",
