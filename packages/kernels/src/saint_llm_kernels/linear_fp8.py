@@ -25,6 +25,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from saint_llm_kernels.fp8_gemm import fp8_gemm, is_fp8_gemm_supported
 from saint_llm_kernels.quant import Fp8Format, fake_quant_fp8
 
 
@@ -53,6 +54,7 @@ class Fp8Linear(nn.Module):
         activation_fmt: Fp8Format = Fp8Format.E4M3,
         weight_axis: int | None = 0,
         activation_axis: int | None = None,
+        use_real_fp8_gemm: bool = False,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
@@ -63,6 +65,10 @@ class Fp8Linear(nn.Module):
         self.activation_fmt = activation_fmt
         self.weight_axis = weight_axis
         self.activation_axis = activation_axis
+        # Opt-in: when True and on Ada/Hopper+ CUDA, swap fake_quant for a real
+        # torch._scaled_mm call. Forces rowwise activation + colwise weight scale
+        # in that path (the only supported per-channel combo on Ada).
+        self.use_real_fp8_gemm = use_real_fp8_gemm
 
         factory_kwargs: dict[str, Any] = {}
         if device is not None:
@@ -87,6 +93,16 @@ class Fp8Linear(nn.Module):
             nn.init.uniform_(self.bias, -bound, bound)
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.use_real_fp8_gemm and is_fp8_gemm_supported(x.device):
+            out = fp8_gemm(
+                x, self.weight,
+                weight_fmt=self.weight_fmt,
+                activation_fmt=self.activation_fmt,
+                out_dtype=torch.bfloat16,
+            )
+            if self.bias is not None:
+                out = out + self.bias.to(out.dtype)
+            return out.to(x.dtype)
         x_q = fake_quant_fp8(x, fmt=self.activation_fmt, axis=self.activation_axis)
         w_q = fake_quant_fp8(self.weight, fmt=self.weight_fmt, axis=self.weight_axis)
         return F.linear(x_q, w_q, self.bias)
