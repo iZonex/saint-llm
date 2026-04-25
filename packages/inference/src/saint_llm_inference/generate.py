@@ -1,4 +1,4 @@
-"""Basic decoding loops — greedy and top-k temperature sampling.
+"""Basic decoding loops — greedy, top-k, and top-p (nucleus) sampling.
 
 No KV cache yet: every step recomputes the full forward over the running prompt.
 That's intentional for v0.1 — gets us a working "talk to the model" surface
@@ -101,6 +101,88 @@ def top_k_sample(
         probs = torch.softmax(top_vals, dim=-1)
         sampled_in_topk = torch.multinomial(probs, num_samples=1, generator=generator)
         next_token = top_idx.gather(-1, sampled_in_topk)
+        tokens = torch.cat([tokens, next_token], dim=-1)
+        if eos_token is not None:
+            seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
+            if bool(seen_eos.all().item()):
+                pad = max_new_tokens - (tokens.shape[1] - prompt_ids.shape[1])
+                if pad > 0:
+                    pad_tensor = next_token.new_full((prompt_ids.shape[0], pad), eos_token)
+                    tokens = torch.cat([tokens, pad_tensor], dim=-1)
+                break
+    return tokens
+
+
+def _filter_top_p(logits: Tensor, p: float) -> Tensor:
+    """Mask out tokens outside the smallest-cumulative-mass-≤-p nucleus.
+
+    Returns a copy of ``logits`` with ``-inf`` on masked positions. The nucleus
+    always contains at least the highest-probability token (so an extreme
+    p value never blanks out the distribution).
+    """
+    sorted_logits, sorted_idx = logits.sort(dim=-1, descending=True)
+    sorted_probs = torch.softmax(sorted_logits, dim=-1)
+    cumulative = sorted_probs.cumsum(dim=-1)
+    # Keep the smallest set whose cumulative mass crosses p.
+    sorted_keep = cumulative - sorted_probs <= p  # bool (B, V)
+    # Always keep the top token even if p is tiny.
+    sorted_keep[..., 0] = True
+    keep = torch.zeros_like(sorted_keep)
+    keep.scatter_(-1, sorted_idx, sorted_keep)
+    return logits.masked_fill(~keep, float("-inf"))
+
+
+@torch.no_grad()
+def top_p_sample(
+    model: SaintLLM,
+    prompt_ids: Tensor,
+    *,
+    max_new_tokens: int,
+    p: float = 0.9,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    eos_token: int | None = None,
+    generator: torch.Generator | None = None,
+) -> Tensor:
+    """Nucleus (top-p) sampling, optionally combined with a top-k cap.
+
+    For each step:
+      1. Scale logits by ``1/temperature``.
+      2. (Optional) restrict to the top ``top_k`` logits first.
+      3. Drop the smallest-probability tail outside the cumulative-≤-p
+         nucleus (rescaled).
+      4. Sample from the remaining distribution.
+
+    ``temperature == 0`` falls back to greedy. ``p`` outside (0, 1] raises.
+    """
+    if prompt_ids.dim() != 2:
+        raise ValueError(f"prompt_ids must be 2D (B, T); got shape {tuple(prompt_ids.shape)}")
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be ≥ 0; got {temperature}")
+    if not (0.0 < p <= 1.0):
+        raise ValueError(f"p must be in (0, 1]; got {p}")
+    if top_k is not None and top_k <= 0:
+        raise ValueError(f"top_k must be positive when set; got {top_k}")
+
+    if temperature < 1.0e-8:
+        return greedy_decode(model, prompt_ids, max_new_tokens=max_new_tokens, eos_token=eos_token)
+
+    tokens = prompt_ids
+    seen_eos = torch.zeros(prompt_ids.shape[0], dtype=torch.bool, device=prompt_ids.device)
+    for _ in range(max_new_tokens):
+        out = model(tokens)
+        logits = out["logits"]
+        assert isinstance(logits, Tensor)
+        last = logits[:, -1, :] / temperature
+
+        if top_k is not None:
+            k_eff = min(top_k, last.shape[-1])
+            cutoff = last.topk(k_eff, dim=-1).values[..., -1:]
+            last = torch.where(last < cutoff, last.new_full((), float("-inf")), last)
+        if p < 1.0:
+            last = _filter_top_p(last, p)
+        probs = torch.softmax(last, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1, generator=generator)
         tokens = torch.cat([tokens, next_token], dim=-1)
         if eos_token is not None:
             seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
