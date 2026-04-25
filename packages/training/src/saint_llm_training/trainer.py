@@ -14,6 +14,8 @@ HuggingFace-Trainer-style godclass.
 
 from __future__ import annotations
 
+import math
+from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Protocol
@@ -61,29 +63,65 @@ class Trainer:
         lr_scheduler: _LRSchedulerLike | None = None,
         grad_clip_norm: float | None = None,
         metrics_callback: MetricsCallback | None = None,
+        skip_nonfinite_loss: bool = True,
+        loss_spike_factor: float | None = None,
+        loss_spike_window: int = 32,
         device: torch.device | str | None = None,
     ) -> None:
         if grad_clip_norm is not None and grad_clip_norm <= 0:
             raise ValueError(f"grad_clip_norm must be > 0 when set; got {grad_clip_norm}")
+        if loss_spike_factor is not None and loss_spike_factor <= 1.0:
+            raise ValueError(
+                f"loss_spike_factor must be > 1.0 when set; got {loss_spike_factor}",
+            )
+        if loss_spike_window <= 0:
+            raise ValueError(f"loss_spike_window must be > 0; got {loss_spike_window}")
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.lr_scheduler = lr_scheduler
         self.grad_clip_norm = grad_clip_norm
         self.metrics_callback = metrics_callback
+        self.skip_nonfinite_loss = skip_nonfinite_loss
+        self.loss_spike_factor = loss_spike_factor
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.step = 0
+        self.skipped_steps = 0
+        self._recent_losses: deque[float] = deque(maxlen=loss_spike_window)
 
     def train_step(self, batch: Tensor) -> float:
         """One forward + backward + optimizer step. Returns the scalar loss value.
 
-        If a ``metrics_callback`` is configured, fires it with the post-step
-        global ``self.step`` and a dict of float metrics: ``loss``, ``lr``,
-        and ``grad_norm`` (when grad clipping is enabled).
+        Skip semantics:
+        * non-finite loss (``skip_nonfinite_loss=True``, default) skips the
+          backward + optimizer step, zeros gradients, increments
+          ``skipped_steps``, and does not advance ``step`` or the LR scheduler.
+        * loss > ``median(recent) * loss_spike_factor`` (when configured) is
+          treated the same way, with reason ``"spike"``.
+
+        ``metrics_callback`` (if set) fires for every call — successful or
+        skipped — with at minimum ``loss`` and ``lr``. Skipped calls also
+        carry ``skipped: 1.0`` and ``skip_reason`` is encoded as ``nan`` (1.0)
+        or ``spike`` (1.0) so the caller can route to wandb/tags directly.
         """
         self.model.train()
         batch = batch.to(self.device)
         loss = self.loss_fn(self.model, batch)
+        loss_value = float(loss.detach().item())
+
+        skip_reason: str | None = None
+        if self.skip_nonfinite_loss and not math.isfinite(loss_value):
+            skip_reason = "nan"
+        elif self.loss_spike_factor is not None and self._is_loss_spike(loss_value):
+            skip_reason = "spike"
+
+        if skip_reason is not None:
+            # Throw away any partial graph + grads accumulated so far.
+            self.optimizer.zero_grad(set_to_none=True)
+            self.skipped_steps += 1
+            self._fire_callback(loss_value, grad_norm=None, skip_reason=skip_reason)
+            return loss_value
+
         self.optimizer.zero_grad()
         loss.backward()
         grad_norm: float | None = None
@@ -96,17 +134,42 @@ class Trainer:
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.step += 1
-
-        loss_value = float(loss.detach().item())
-        if self.metrics_callback is not None:
-            metrics: dict[str, float] = {
-                "loss": loss_value,
-                "lr": float(self.optimizer.param_groups[0]["lr"]),
-            }
-            if grad_norm is not None:
-                metrics["grad_norm"] = grad_norm
-            self.metrics_callback(self.step, metrics)
+        self._recent_losses.append(loss_value)
+        self._fire_callback(loss_value, grad_norm=grad_norm, skip_reason=None)
         return loss_value
+
+    def _is_loss_spike(self, loss_value: float) -> bool:
+        """True if ``loss_value`` exceeds ``median(recent) * loss_spike_factor``.
+
+        Returns False before enough history has accumulated (need at least 4
+        prior losses to estimate a stable median).
+        """
+        if self.loss_spike_factor is None or len(self._recent_losses) < 4:
+            return False
+        sorted_losses = sorted(self._recent_losses)
+        n = len(sorted_losses)
+        median = sorted_losses[n // 2] if n % 2 == 1 else 0.5 * (sorted_losses[n // 2 - 1] + sorted_losses[n // 2])
+        return loss_value > median * self.loss_spike_factor
+
+    def _fire_callback(
+        self,
+        loss_value: float,
+        *,
+        grad_norm: float | None,
+        skip_reason: str | None,
+    ) -> None:
+        if self.metrics_callback is None:
+            return
+        metrics: dict[str, float] = {
+            "loss": loss_value,
+            "lr": float(self.optimizer.param_groups[0]["lr"]),
+        }
+        if grad_norm is not None:
+            metrics["grad_norm"] = grad_norm
+        if skip_reason is not None:
+            metrics["skipped"] = 1.0
+            metrics[f"skip_reason_{skip_reason}"] = 1.0
+        self.metrics_callback(self.step, metrics)
 
     @torch.no_grad()
     def evaluate(self, eval_iter: Iterable[Tensor]) -> float:

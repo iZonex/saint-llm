@@ -295,3 +295,98 @@ def test_no_metrics_callback_default(trainer: Trainer) -> None:
     """Default Trainer has no callback — train_step doesn't blow up trying to fire one."""
     assert trainer.metrics_callback is None
     trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+
+
+def _nan_loss_fn(model: nn.Module, batch: torch.Tensor) -> torch.Tensor:
+    """Loss function that returns NaN regardless of input (to test skip path)."""
+    out = model(batch)
+    return out["logits"].mean() * float("nan")
+
+
+def test_nonfinite_loss_skipped_by_default() -> None:
+    """Default Trainer skips a non-finite loss step instead of corrupting weights."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_nan_loss_fn)
+
+    snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert trainer.skipped_steps == 1
+    assert trainer.step == 0
+    # Weights must be unchanged after the skip.
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, snapshot[k]), f"weights changed under NaN loss: {k}"
+
+
+def test_skip_nonfinite_loss_can_be_disabled() -> None:
+    """skip_nonfinite_loss=False lets the NaN through (default off → backward fires)."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_nan_loss_fn, skip_nonfinite_loss=False)
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    # step counter incremented (no skip)
+    assert trainer.step == 1
+    assert trainer.skipped_steps == 0
+
+
+def test_loss_spike_skips_step() -> None:
+    """A loss far above the recent median must be skipped when factor is set."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    spike_loss = [None]
+
+    def variable_loss(m: nn.Module, batch: torch.Tensor) -> torch.Tensor:
+        out = m(batch)
+        base = out["logits"].mean() * 0.0  # zero gradient contribution
+        if spike_loss[0] is None:
+            return base + 1.0  # baseline ~1.0
+        return base + spike_loss[0]
+
+    trainer = Trainer(
+        model, opt, loss_fn=variable_loss,
+        loss_spike_factor=10.0,
+    )
+    # Build history.
+    for _ in range(6):
+        trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert trainer.step == 6
+
+    # Now inject a loss 100x above median — must be skipped.
+    spike_loss[0] = 100.0
+    snapshot = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert trainer.skipped_steps == 1
+    assert trainer.step == 6  # no advance
+    # Weights unchanged because the spike triggered skip.
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, snapshot[k]), f"weights changed under spike: {k}"
+
+
+def test_loss_spike_factor_validated() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    with pytest.raises(ValueError, match="loss_spike_factor"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, loss_spike_factor=1.0)
+    with pytest.raises(ValueError, match="loss_spike_factor"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, loss_spike_factor=0.5)
+
+
+def test_metrics_callback_marks_skipped() -> None:
+    """Callback gets ``skipped`` + ``skip_reason_nan`` when NaN happens."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    seen: list[dict[str, float]] = []
+    trainer = Trainer(
+        model, opt, loss_fn=_nan_loss_fn,
+        metrics_callback=lambda _step, m: seen.append(dict(m)),
+    )
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert "skipped" in seen[0]
+    assert "skip_reason_nan" in seen[0]
