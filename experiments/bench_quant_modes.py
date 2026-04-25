@@ -42,15 +42,16 @@ class BenchCase:
 
 
 def _all_cases() -> list[BenchCase]:
-    cases = []
-    for quant in ("bf16", "fp8", "fp4"):
-        for grouped in (False, True):
-            cases.append(BenchCase(
-                name=f"{quant:<4}/{'grouped' if grouped else 'per-exp'}",
-                linear_quant=quant,
-                moe_use_grouped_gemm=grouped,
-                fp8_use_real_gemm=False,
-            ))
+    cases = [
+        BenchCase(
+            name=f"{quant:<4}/{'grouped' if grouped else 'per-exp'}",
+            linear_quant=quant,
+            moe_use_grouped_gemm=grouped,
+            fp8_use_real_gemm=False,
+        )
+        for quant in ("bf16", "fp8", "fp4")
+        for grouped in (False, True)
+    ]
     # FP8 with real GEMM (separate from emulated fp8).
     cases.append(BenchCase(
         name="fp8 +real-gemm/per-exp",
@@ -88,24 +89,24 @@ def _measure(
 
     token_ids = torch.randint(0, cfg.vocab_size, (1, seq_len), device=device)
 
-    def step() -> None:
-        out = model(token_ids)
+    def step_once() -> None:
+        out = model(token_ids)  # noqa: F821 - closure over outer scope
         logits = out["logits"]
         loss = F.cross_entropy(
             logits[:, :-1].reshape(-1, cfg.vocab_size),
             token_ids[:, 1:].reshape(-1),
         )
-        optim.zero_grad()
+        optim.zero_grad()  # noqa: F821 - closure over outer scope
         loss.backward()
-        optim.step()
+        optim.step()  # noqa: F821 - closure over outer scope
 
     for _ in range(warmup):
-        step()
+        step_once()
     if device.type == "cuda":
         torch.cuda.synchronize()
     t0 = time.perf_counter()
     for _ in range(steps):
-        step()
+        step_once()
     if device.type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0

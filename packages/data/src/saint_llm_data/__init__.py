@@ -16,6 +16,7 @@ Planned (not yet implemented):
     tokenizer           — Own BBPE 131K (per AUGMENTATIONS TOK-01..06)
 """
 
+from saint_llm_data.dataset import TextFileDataset
 from saint_llm_data.packing import PackedBatch, pack_into_batch, pack_sequences
 from saint_llm_data.tokenizer import CharTokenizer, HFTokenizer, Tokenizer
 
@@ -25,6 +26,7 @@ __all__ = [
     "CharTokenizer",
     "HFTokenizer",
     "PackedBatch",
+    "TextFileDataset",
     "Tokenizer",
     "pack_into_batch",
     "pack_sequences",

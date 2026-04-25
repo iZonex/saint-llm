@@ -1,13 +1,15 @@
 """End-to-end demo: train SaintLLM on a fixed sequence, measure PPL, generate.
 
 Stitches together everything we've built so far — model build, optimizer step,
-perplexity eval, greedy + top-k sampling — into one runnable script. Useful as
-a smoke test of the whole pipeline and as a starting template for a real run.
+perplexity eval, greedy + top-k sampling, and (with --text-file) tokenized
+text streaming via TextFileDataset — into one runnable script. Smoke test for
+the whole pipeline and a starting template for a real run.
 
 Usage:
     uv run python experiments/train_eval.py
     uv run python experiments/train_eval.py --steps 100 --eval-every 10
     uv run python experiments/train_eval.py --quant fp8 --grouped-moe --device cuda
+    uv run python experiments/train_eval.py --text-file path/to/corpus.txt
 
 Tiny config so it finishes in seconds on Mac/CPU. Real trainings live in
 training/ and consume datasets via the data pipeline.
@@ -22,6 +24,7 @@ import torch
 import torch.nn.functional as F
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
+from saint_llm_data import CharTokenizer, TextFileDataset
 from saint_llm_eval import compute_perplexity
 from saint_llm_inference import greedy_decode, top_k_sample
 
@@ -69,18 +72,51 @@ def main() -> int:
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--text-file",
+        default=None,
+        help="optional path to a plain-text or JSONL corpus; if set, "
+             "training cycles through tokenized batches instead of using a "
+             "fixed random sequence.",
+    )
+    parser.add_argument("--jsonl", action="store_true")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
     cfg = _build_cfg(args)
     device = torch.device(args.device)
 
+    if args.text_file is not None:
+        # CharTokenizer keeps the demo dependency-light. Swap to HFTokenizer
+        # for production runs (vocab needs to match cfg.vocab_size).
+        tok = CharTokenizer(unicode_max=cfg.vocab_size - 16)
+        ds = TextFileDataset(
+            args.text_file, tokenizer=tok,
+            seq_len=args.seq_len, batch_size=1,
+            jsonl=args.jsonl, drop_last=True,
+        )
+
+        def _train_batches() -> torch.Tensor:
+            while True:
+                emitted = False
+                for batch in ds:
+                    emitted = True
+                    yield batch.tokens.to(device)
+                if not emitted:
+                    raise RuntimeError(f"Corpus {args.text_file} produced no batches")
+
+        text_stream = _train_batches()
+        train_seq = next(text_stream)
+        eval_seq = next(text_stream)
+        prompt = train_seq[:, :4].clone()
+    else:
+        text_stream = None
+        train_seq = torch.randint(0, cfg.vocab_size, (1, args.seq_len), device=device)
+        eval_seq = torch.randint(0, cfg.vocab_size, (1, args.seq_len), device=device)
+        prompt = train_seq[:, :4].clone()
+
     model = SaintLLM(cfg).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
-
-    train_seq = torch.randint(0, cfg.vocab_size, (1, args.seq_len), device=device)
-    eval_seq = torch.randint(0, cfg.vocab_size, (1, args.seq_len), device=device)
-    prompt = train_seq[:, :4].clone()
 
     cfg_summary = (
         f"cfg.tiny | linear_quant={cfg.linear_quant} grouped_moe={cfg.moe_use_grouped_gemm}"
@@ -94,6 +130,8 @@ def main() -> int:
     for step in range(args.steps + 1):
         if step > 0:
             model.train()
+            if text_stream is not None:
+                train_seq = next(text_stream)
             train_loss = _train_step(model, train_seq, optim, cfg)
         else:
             train_loss = float("nan")
