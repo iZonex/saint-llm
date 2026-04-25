@@ -35,6 +35,7 @@ class _LRSchedulerLike(Protocol):
 
 
 LossFn = Callable[[nn.Module, Tensor], Tensor]
+MetricsCallback = Callable[[int, dict[str, float]], None]
 
 
 class Trainer:
@@ -59,6 +60,7 @@ class Trainer:
         loss_fn: LossFn,
         lr_scheduler: _LRSchedulerLike | None = None,
         grad_clip_norm: float | None = None,
+        metrics_callback: MetricsCallback | None = None,
         device: torch.device | str | None = None,
     ) -> None:
         if grad_clip_norm is not None and grad_clip_norm <= 0:
@@ -68,23 +70,43 @@ class Trainer:
         self.loss_fn = loss_fn
         self.lr_scheduler = lr_scheduler
         self.grad_clip_norm = grad_clip_norm
+        self.metrics_callback = metrics_callback
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.step = 0
 
     def train_step(self, batch: Tensor) -> float:
-        """One forward + backward + optimizer step. Returns the scalar loss value."""
+        """One forward + backward + optimizer step. Returns the scalar loss value.
+
+        If a ``metrics_callback`` is configured, fires it with the post-step
+        global ``self.step`` and a dict of float metrics: ``loss``, ``lr``,
+        and ``grad_norm`` (when grad clipping is enabled).
+        """
         self.model.train()
         batch = batch.to(self.device)
         loss = self.loss_fn(self.model, batch)
         self.optimizer.zero_grad()
         loss.backward()
+        grad_norm: float | None = None
         if self.grad_clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
+            total_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.grad_clip_norm,
+            )
+            grad_norm = float(total_norm.detach().item()) if isinstance(total_norm, Tensor) else float(total_norm)
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.step += 1
-        return float(loss.detach().item())
+
+        loss_value = float(loss.detach().item())
+        if self.metrics_callback is not None:
+            metrics: dict[str, float] = {
+                "loss": loss_value,
+                "lr": float(self.optimizer.param_groups[0]["lr"]),
+            }
+            if grad_norm is not None:
+                metrics["grad_norm"] = grad_norm
+            self.metrics_callback(self.step, metrics)
+        return loss_value
 
     @torch.no_grad()
     def evaluate(self, eval_iter: Iterable[Tensor]) -> float:

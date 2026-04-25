@@ -232,3 +232,66 @@ def test_evaluate_leaves_eval_mode_when_called_from_eval() -> None:
 def test_evaluate_empty_iterator_raises(trainer: Trainer) -> None:
     with pytest.raises(ValueError, match="empty iterator"):
         trainer.evaluate(iter([]))
+
+
+def test_metrics_callback_fires_per_step() -> None:
+    """metrics_callback receives (step, dict) on every train_step."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    seen: list[tuple[int, dict[str, float]]] = []
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        metrics_callback=lambda step, m: seen.append((step, dict(m))),
+    )
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    trainer.train_step(batch)
+    trainer.train_step(batch)
+    assert len(seen) == 2
+    # Steps recorded post-increment.
+    assert seen[0][0] == 1
+    assert seen[1][0] == 2
+    assert "loss" in seen[0][1]
+    assert "lr" in seen[0][1]
+    assert "grad_norm" not in seen[0][1]  # no clip → no grad_norm
+
+
+def test_metrics_callback_includes_grad_norm_when_clipping() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    seen: list[dict[str, float]] = []
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        grad_clip_norm=1.0,
+        metrics_callback=lambda _step, m: seen.append(dict(m)),
+    )
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert "grad_norm" in seen[0]
+    assert torch.isfinite(torch.tensor(seen[0]["grad_norm"]))
+
+
+def test_metrics_callback_lr_tracks_scheduler() -> None:
+    """When an LR scheduler is set, the reported lr matches the scheduled value."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.1)
+    seen: list[float] = []
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        lr_scheduler=sched,
+        metrics_callback=lambda _step, m: seen.append(m["lr"]),
+    )
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    # After step 1, lr decayed to 1e-4; step 2, decayed to 1e-5.
+    assert seen[0] == pytest.approx(1.0e-4, rel=1.0e-3)
+    assert seen[1] == pytest.approx(1.0e-5, rel=1.0e-3)
+
+
+def test_no_metrics_callback_default(trainer: Trainer) -> None:
+    """Default Trainer has no callback — train_step doesn't blow up trying to fire one."""
+    assert trainer.metrics_callback is None
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
