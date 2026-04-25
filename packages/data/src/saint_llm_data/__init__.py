@@ -20,10 +20,12 @@ from saint_llm_data.dataset import TextFileDataset
 from saint_llm_data.hf_dataset import HuggingFaceTextDataset
 from saint_llm_data.packing import PackedBatch, pack_into_batch, pack_sequences
 from saint_llm_data.tokenizer import CharTokenizer, HFTokenizer, Tokenizer
+from saint_llm_data.tokenizer_trainer import DEFAULT_SPECIAL_TOKENS, train_bbpe
 
 __version__ = "0.0.1"
 
 __all__ = [
+    "DEFAULT_SPECIAL_TOKENS",
     "CharTokenizer",
     "HFTokenizer",
     "HuggingFaceTextDataset",
@@ -32,4 +34,5 @@ __all__ = [
     "Tokenizer",
     "pack_into_batch",
     "pack_sequences",
+    "train_bbpe",
 ]
