@@ -26,6 +26,7 @@ Quick smoke run (synthetic random tokens, no tokenizer needed):
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 import time
 from collections.abc import Iterator
@@ -49,6 +50,25 @@ from saint_llm_training import (
     warmup_cosine_schedule,
 )
 from torch.utils.data import DataLoader
+
+_CKPT_STEP_RE = re.compile(r"\.step(\d+)\.pt$")
+
+
+def _find_latest_checkpoint(output_dir: Path, base_name: str = "ckpt") -> Path | None:
+    """Return the highest-step checkpoint file in ``output_dir``, or None."""
+    pattern = re.compile(rf"^{re.escape(base_name)}\.step(\d+)\.pt$")
+    candidates: list[tuple[int, Path]] = []
+    if not output_dir.exists():
+        return None
+    for path in output_dir.iterdir():
+        if not path.is_file():
+            continue
+        m = pattern.match(path.name)
+        if m is not None:
+            candidates.append((int(m.group(1)), path))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda x: x[0])[1]
 
 
 def _build_cfg(args: argparse.Namespace) -> ModelConfig:
@@ -146,6 +166,9 @@ def main() -> int:
     # IO
     parser.add_argument("--output-dir", type=Path, default=Path("./run"))
     parser.add_argument("--keep-last-n", type=int, default=3)
+    parser.add_argument("--resume", action="store_true",
+                        help="if set and --output-dir contains ckpt.step{N}.pt, "
+                             "load the highest-N checkpoint and continue.")
     parser.add_argument(
         "--device", default="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -212,13 +235,29 @@ def main() -> int:
         args.output_dir / "ckpt.pt", keep_last_n=args.keep_last_n,
     )
 
+    # Optional resume from latest ckpt in output_dir.
+    if args.resume:
+        latest = _find_latest_checkpoint(args.output_dir)
+        if latest is not None:
+            extra = trainer.load(latest)
+            print(
+                f"Resumed from {latest.name} at step {trainer.step}; "
+                f"extra={extra if extra else '{}'}",
+            )
+            if trainer.step >= args.steps:
+                print(f"Already at step {trainer.step} ≥ target {args.steps}; nothing to do.")
+                return 0
+        else:
+            print("No checkpoint found in --output-dir; starting fresh.")
+
     data_iter = _build_data_iter(args, tokenizer, device)
     eval_batch = next(data_iter)
     prompt = eval_batch[:, :8].clone()
 
     print()
     t0 = time.perf_counter()
-    next_save = args.save_every
+    initial_step = trainer.step
+    next_save = trainer.step + args.save_every
     while trainer.step < args.steps:
         batch = next(data_iter)
         trainer.train_step(batch)
@@ -231,7 +270,8 @@ def main() -> int:
         if trainer.step % args.eval_every == 0 and trainer.step > 0:
             ppl = compute_perplexity(trainer.model, eval_batch)
             elapsed = time.perf_counter() - t0
-            tok_per_s = (trainer.step * args.grad_accum * args.seq_len) / max(elapsed, 1.0e-3)
+            steps_done = trainer.step - initial_step
+            tok_per_s = (steps_done * args.grad_accum * args.seq_len) / max(elapsed, 1.0e-3)
             print(f"  ↳ eval_ppl={ppl:.2f}  throughput={tok_per_s:.0f} tok/s  elapsed={elapsed:.1f}s")
 
     print()
