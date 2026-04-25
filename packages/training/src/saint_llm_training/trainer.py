@@ -58,12 +58,16 @@ class Trainer:
         *,
         loss_fn: LossFn,
         lr_scheduler: _LRSchedulerLike | None = None,
+        grad_clip_norm: float | None = None,
         device: torch.device | str | None = None,
     ) -> None:
+        if grad_clip_norm is not None and grad_clip_norm <= 0:
+            raise ValueError(f"grad_clip_norm must be > 0 when set; got {grad_clip_norm}")
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
         self.lr_scheduler = lr_scheduler
+        self.grad_clip_norm = grad_clip_norm
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.step = 0
 
@@ -74,6 +78,8 @@ class Trainer:
         loss = self.loss_fn(self.model, batch)
         self.optimizer.zero_grad()
         loss.backward()
+        if self.grad_clip_norm is not None:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip_norm)
         self.optimizer.step()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()

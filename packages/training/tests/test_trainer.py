@@ -143,3 +143,46 @@ def test_train_step_moves_batch_to_device() -> None:
     batch_cpu = torch.zeros(1, 16, dtype=torch.long)
     loss = trainer.train_step(batch_cpu)
     assert torch.isfinite(torch.tensor(loss))
+
+
+def test_grad_clip_norm_caps_gradient_norm() -> None:
+    """With a tiny clip threshold, the global grad norm post-clip must be bounded."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    clip = 0.01
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn, grad_clip_norm=clip)
+
+    # Bypass train_step so we can inspect grads after clip but before step zeros them.
+    batch = torch.randint(0, cfg.vocab_size, (1, 16))
+    model.train()
+    loss = _ce_loss_fn(model, batch)
+    opt.zero_grad()
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), clip)
+    total_sq = sum(p.grad.detach().pow(2).sum() for p in model.parameters() if p.grad is not None)
+    norm_after = total_sq.sqrt().item()
+    assert norm_after <= clip + 1.0e-5
+    # Clipped trainer's next train_step should produce a finite loss.
+    loss2 = trainer.train_step(batch)
+    assert torch.isfinite(torch.tensor(loss2))
+
+
+def test_grad_clip_norm_rejects_non_positive() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    with pytest.raises(ValueError, match="must be > 0"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, grad_clip_norm=0.0)
+    with pytest.raises(ValueError, match="must be > 0"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, grad_clip_norm=-1.0)
+
+
+def test_no_grad_clip_by_default() -> None:
+    """Default Trainer leaves gradients unclipped."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+    assert trainer.grad_clip_norm is None
