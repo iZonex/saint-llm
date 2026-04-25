@@ -17,6 +17,7 @@ Planned (not yet implemented):
 """
 
 from saint_llm_data.dataset import TextFileDataset
+from saint_llm_data.hf_dataset import HuggingFaceTextDataset
 from saint_llm_data.packing import PackedBatch, pack_into_batch, pack_sequences
 from saint_llm_data.tokenizer import CharTokenizer, HFTokenizer, Tokenizer
 
@@ -25,6 +26,7 @@ __version__ = "0.0.1"
 __all__ = [
     "CharTokenizer",
     "HFTokenizer",
+    "HuggingFaceTextDataset",
     "PackedBatch",
     "TextFileDataset",
     "Tokenizer",
