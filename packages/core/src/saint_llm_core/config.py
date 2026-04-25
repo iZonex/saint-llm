@@ -132,6 +132,12 @@ class ModelConfig(BaseModel):
     # Limitation: grouped path is bf16/fp32 only — no fp8/fp4 quant on routed experts
     # in this mode. shared_experts still respect linear_quant.
     moe_use_grouped_gemm: bool = False
+    # Trade activation memory for recomputation: wrap each TransformerBlock.forward
+    # in torch.utils.checkpoint during training. Forward stores only the block's
+    # input tensor; backward re-runs the block to materialize activations.
+    # Required to fit reasonable batch+seq_len of small_flash into 12 GB hpomen.
+    # No-op when model.eval(); zero overhead at inference.
+    activation_checkpointing: bool = False
 
     @classmethod
     def v4_flash(cls) -> ModelConfig:

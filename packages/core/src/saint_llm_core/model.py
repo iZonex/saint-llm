@@ -30,7 +30,9 @@ Each transformer block:
 
 from __future__ import annotations
 
+import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from saint_llm_core.attention import CSA, HCA, RMSNorm, SWAttention
 from saint_llm_core.config import ModelConfig
@@ -39,6 +41,28 @@ from saint_llm_core.mtp import MTPStack
 from saint_llm_core.multimodal import GenerationHeadHook, ModalityProjector, ResidualSideChannel
 from saint_llm_core.quant import make_linear_factory
 from saint_llm_core.residual import MHC
+
+
+class _CheckpointedBlock:
+    """Closure-style adapter so torch.utils.checkpoint sees a single-tensor input.
+
+    ``token_ids`` and ``is_visual`` are bound at construction time (per-step
+    constants from the surrounding forward). ``checkpoint(use_reentrant=False)``
+    handles non-tensor saved state without needing them as positional args.
+    """
+
+    def __init__(
+        self,
+        block: nn.Module,
+        token_ids: Tensor,
+        is_visual: Tensor | None,
+    ) -> None:
+        self.block = block
+        self.token_ids = token_ids
+        self.is_visual = is_visual
+
+    def __call__(self, x_expanded: Tensor) -> Tensor:
+        return self.block(x_expanded, token_ids=self.token_ids, is_visual=self.is_visual)
 
 
 class TransformerBlock(nn.Module):
@@ -199,8 +223,16 @@ class SaintLLM(nn.Module):
             is_visual = token_ids == self.cfg.tokenizer_slots.image_pad
 
         x_expanded = MHC.expand(h, self.cfg.mhc.expansion_factor)
+        use_ckpt = self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled()
         for block in self.blocks:
-            x_expanded = block(x_expanded, token_ids=token_ids, is_visual=is_visual)
+            if use_ckpt:
+                x_expanded = checkpoint(
+                    _CheckpointedBlock(block, token_ids, is_visual),
+                    x_expanded,
+                    use_reentrant=False,
+                )
+            else:
+                x_expanded = block(x_expanded, token_ids=token_ids, is_visual=is_visual)
         h = MHC.collapse(x_expanded)
         h = self.final_norm(h)
 
