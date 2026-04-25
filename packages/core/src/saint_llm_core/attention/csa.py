@@ -33,6 +33,7 @@ from saint_llm_core.attention.common import (
     sliding_window_mask,
 )
 from saint_llm_core.config import AttentionConfig, CSAConfig
+from saint_llm_core.moe import LinearFactory, _default_linear
 
 
 class TokenLevelCompressor(nn.Module):
@@ -176,19 +177,26 @@ class CSA(nn.Module):
     Forward signature matches the inner-layer contract used by mHC: (B, T, d) -> (B, T, d).
     """
 
-    def __init__(self, hidden_dim: int, attn: AttentionConfig, csa: CSAConfig) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        attn: AttentionConfig,
+        csa: CSAConfig,
+        *,
+        linear_factory: LinearFactory = _default_linear,
+    ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.attn_cfg = attn
         self.csa_cfg = csa
 
-        self.q_compressor = nn.Linear(hidden_dim, attn.query_compression_dim, bias=False)
-        self.q_up = nn.Linear(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
+        self.q_compressor = linear_factory(hidden_dim, attn.query_compression_dim, bias=False)
+        self.q_up = linear_factory(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
 
         self.kv_compressor = TokenLevelCompressor(hidden_dim, attn.head_dim, csa.compression_rate)
         # Sliding-window KV path (uncompressed, shared across heads — MQA).
-        self.k_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
+        self.k_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
+        self.v_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
 
         self.indexer = LightningIndexer(
             hidden_dim,

@@ -23,21 +23,29 @@ from saint_llm_core.attention.common import (
 )
 from saint_llm_core.attention.csa import GroupedOutputProjection, TokenLevelCompressor
 from saint_llm_core.config import AttentionConfig, HCAConfig
+from saint_llm_core.moe import LinearFactory, _default_linear
 
 
 class HCA(nn.Module):
-    def __init__(self, hidden_dim: int, attn: AttentionConfig, hca: HCAConfig) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        attn: AttentionConfig,
+        hca: HCAConfig,
+        *,
+        linear_factory: LinearFactory = _default_linear,
+    ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.attn_cfg = attn
         self.hca_cfg = hca
 
-        self.q_compressor = nn.Linear(hidden_dim, attn.query_compression_dim, bias=False)
-        self.q_up = nn.Linear(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
+        self.q_compressor = linear_factory(hidden_dim, attn.query_compression_dim, bias=False)
+        self.q_up = linear_factory(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
 
         self.kv_compressor = TokenLevelCompressor(hidden_dim, attn.head_dim, hca.compression_rate)
-        self.k_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
+        self.k_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
+        self.v_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
 
         self.q_norm = RMSNorm(attn.head_dim)
         self.k_norm = RMSNorm(attn.head_dim)

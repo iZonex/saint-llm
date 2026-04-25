@@ -54,13 +54,13 @@ class TransformerBlock(nn.Module):
 
         attn_module: nn.Module
         if layer_idx < cfg.first_dense_swa_layers:
-            attn_module = SWAttention(cfg.hidden_dim, cfg.attention)
+            attn_module = SWAttention(cfg.hidden_dim, cfg.attention, linear_factory=linear_factory)
         else:
             position_in_csa_hca = layer_idx - cfg.first_dense_swa_layers
             if position_in_csa_hca % 2 == 0:
-                attn_module = CSA(cfg.hidden_dim, cfg.attention, cfg.csa)
+                attn_module = CSA(cfg.hidden_dim, cfg.attention, cfg.csa, linear_factory=linear_factory)
             else:
-                attn_module = HCA(cfg.hidden_dim, cfg.attention, cfg.hca)
+                attn_module = HCA(cfg.hidden_dim, cfg.attention, cfg.hca, linear_factory=linear_factory)
         self.attention = attn_module
 
         self.attn_mhc = MHC(cfg.hidden_dim, cfg.mhc, rms_norm_eps=cfg.rms_norm_eps)

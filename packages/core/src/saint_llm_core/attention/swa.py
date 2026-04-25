@@ -19,16 +19,23 @@ from saint_llm_core.attention.common import (
 )
 from saint_llm_core.attention.csa import GroupedOutputProjection
 from saint_llm_core.config import AttentionConfig
+from saint_llm_core.moe import LinearFactory, _default_linear
 
 
 class SWAttention(nn.Module):
-    def __init__(self, hidden_dim: int, attn: AttentionConfig) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        attn: AttentionConfig,
+        *,
+        linear_factory: LinearFactory = _default_linear,
+    ) -> None:
         super().__init__()
         self.attn_cfg = attn
-        self.q_compressor = nn.Linear(hidden_dim, attn.query_compression_dim, bias=False)
-        self.q_up = nn.Linear(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
-        self.k_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
-        self.v_proj = nn.Linear(hidden_dim, attn.head_dim, bias=False)
+        self.q_compressor = linear_factory(hidden_dim, attn.query_compression_dim, bias=False)
+        self.q_up = linear_factory(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
+        self.k_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
+        self.v_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
         self.q_norm = RMSNorm(attn.head_dim)
         self.k_norm = RMSNorm(attn.head_dim)
 

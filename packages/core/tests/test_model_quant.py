@@ -40,6 +40,26 @@ def test_quant_mode_swaps_expert_linears(mode: str) -> None:
     assert type(first_expert.gate_proj) is not nn.Linear
 
 
+@pytest.mark.parametrize("mode", ["fp8", "fp4"])
+def test_quant_mode_swaps_attention_projections(mode: str) -> None:
+    """CSA/HCA/SWAttention top-level projections (q_compressor, q_up, k_proj, v_proj)
+    must swap to Fp8Linear/Fp4Linear under fp8/fp4 modes."""
+    cfg = _tiny().model_copy(update={"linear_quant": mode})
+    model = SaintLLM(cfg)
+    saw_csa_or_hca = False
+    for block in model.blocks:
+        attn = block.attention
+        for attr in ("q_compressor", "q_up", "k_proj", "v_proj"):
+            layer = getattr(attn, attr, None)
+            assert layer is not None, f"{type(attn).__name__} missing {attr}"
+            assert type(layer) is not nn.Linear, (
+                f"{type(attn).__name__}.{attr} not swapped under {mode}"
+            )
+        if type(attn).__name__ in ("CSA", "HCA"):
+            saw_csa_or_hca = True
+    assert saw_csa_or_hca, "tiny config should have at least one CSA/HCA block"
+
+
 @pytest.mark.parametrize("mode", ["bf16", "fp8", "fp4"])
 def test_forward_finite_in_each_quant_mode(mode: str) -> None:
     """End-to-end: SaintLLM forward in each quant mode produces a finite logits tensor."""
