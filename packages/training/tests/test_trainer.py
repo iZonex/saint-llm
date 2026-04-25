@@ -390,3 +390,112 @@ def test_metrics_callback_marks_skipped() -> None:
     trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
     assert "skipped" in seen[0]
     assert "skip_reason_nan" in seen[0]
+
+
+def test_grad_accum_holds_optimizer_until_kth_microstep() -> None:
+    """Weights unchanged on micro-steps 1..K-1; updated on the K-th call."""
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        gradient_accumulation_steps=3,
+    )
+    batch = torch.randint(0, cfg.vocab_size, (1, 16))
+
+    snap = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    trainer.train_step(batch)
+    assert trainer.step == 0
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, snap[k]), f"weights moved on micro-step 1: {k}"
+
+    trainer.train_step(batch)
+    assert trainer.step == 0  # still mid-accumulation
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, snap[k]), f"weights moved on micro-step 2: {k}"
+
+    trainer.train_step(batch)
+    assert trainer.step == 1  # macro step 1 fired
+    changed = any(not torch.equal(v, snap[k]) for k, v in model.state_dict().items())
+    assert changed, "weights did not move on the 3rd micro-step"
+
+
+def test_grad_accum_metrics_callback_only_on_macro_step() -> None:
+    """Callback fires K times less than train_step calls under K-step accumulation."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    seen: list[int] = []
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        gradient_accumulation_steps=4,
+        metrics_callback=lambda step, _m: seen.append(step),
+    )
+    for _ in range(8):
+        trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    # 8 micro-steps / 4 accumulation = 2 macro steps fired.
+    assert seen == [1, 2]
+
+
+def test_grad_accum_lr_scheduler_ticks_on_macro_step_only() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    sched = torch.optim.lr_scheduler.StepLR(opt, step_size=1, gamma=0.1)
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn,
+        lr_scheduler=sched,
+        gradient_accumulation_steps=3,
+    )
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    # Two micro-steps: scheduler shouldn't have ticked.
+    trainer.train_step(batch)
+    trainer.train_step(batch)
+    assert opt.param_groups[0]["lr"] == pytest.approx(1.0e-3)
+    # Third → macro step → scheduler ticks.
+    trainer.train_step(batch)
+    assert opt.param_groups[0]["lr"] == pytest.approx(1.0e-4)
+
+
+def test_grad_accum_invalid_value() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    with pytest.raises(ValueError, match="gradient_accumulation_steps"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, gradient_accumulation_steps=0)
+
+
+def test_grad_accum_default_is_one() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+    assert trainer.gradient_accumulation_steps == 1
+    # And step counter should advance per call.
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert trainer.step == 1
+
+
+def test_grad_accum_skip_resets_micro_step_counter() -> None:
+    """A NaN skip mid-accumulation discards the partial accumulation and resets."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+
+    nan_now = [False]
+
+    def maybe_nan_loss(m: nn.Module, batch: torch.Tensor) -> torch.Tensor:
+        out = m(batch)
+        v = out["logits"].mean() * 0.0
+        if nan_now[0]:
+            return v + float("nan")
+        return v + 1.0
+
+    trainer = Trainer(model, opt, loss_fn=maybe_nan_loss, gradient_accumulation_steps=3)
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))  # micro 1
+    nan_now[0] = True
+    trainer.train_step(torch.zeros(1, 16, dtype=torch.long))  # NaN skip, resets
+    assert trainer._micro_step == 0
+    assert trainer.skipped_steps == 1
+    assert trainer.step == 0

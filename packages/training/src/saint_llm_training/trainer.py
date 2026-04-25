@@ -66,6 +66,7 @@ class Trainer:
         skip_nonfinite_loss: bool = True,
         loss_spike_factor: float | None = None,
         loss_spike_window: int = 32,
+        gradient_accumulation_steps: int = 1,
         device: torch.device | str | None = None,
     ) -> None:
         if grad_clip_norm is not None and grad_clip_norm <= 0:
@@ -76,6 +77,10 @@ class Trainer:
             )
         if loss_spike_window <= 0:
             raise ValueError(f"loss_spike_window must be > 0; got {loss_spike_window}")
+        if gradient_accumulation_steps <= 0:
+            raise ValueError(
+                f"gradient_accumulation_steps must be > 0; got {gradient_accumulation_steps}",
+            )
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -84,25 +89,32 @@ class Trainer:
         self.metrics_callback = metrics_callback
         self.skip_nonfinite_loss = skip_nonfinite_loss
         self.loss_spike_factor = loss_spike_factor
+        self.gradient_accumulation_steps = gradient_accumulation_steps
         self.device = torch.device(device) if device is not None else next(model.parameters()).device
         self.step = 0
         self.skipped_steps = 0
         self._recent_losses: deque[float] = deque(maxlen=loss_spike_window)
+        self._micro_step = 0  # 0..gradient_accumulation_steps-1; resets after optimizer.step
 
     def train_step(self, batch: Tensor) -> float:
-        """One forward + backward + optimizer step. Returns the scalar loss value.
+        """One micro-step. Returns the (un-divided) scalar loss value.
+
+        With ``gradient_accumulation_steps > 1`` the loss is divided by K
+        before backward so the accumulated gradient equals the average over K
+        microbatches; the optimizer step (and scheduler step, callback,
+        ``self.step`` increment) only fires on the K-th call.
 
         Skip semantics:
-        * non-finite loss (``skip_nonfinite_loss=True``, default) skips the
-          backward + optimizer step, zeros gradients, increments
-          ``skipped_steps``, and does not advance ``step`` or the LR scheduler.
-        * loss > ``median(recent) * loss_spike_factor`` (when configured) is
-          treated the same way, with reason ``"spike"``.
+        * non-finite loss (``skip_nonfinite_loss=True``, default) — backward
+          and optimizer step skipped, gradients zeroed, ``skipped_steps``
+          incremented. Counts as an optimizer step boundary: micro-step
+          counter resets so the next call starts a fresh K-window.
+        * loss > ``median(recent) * loss_spike_factor`` — same path, reason
+          ``"spike"``.
 
-        ``metrics_callback`` (if set) fires for every call — successful or
-        skipped — with at minimum ``loss`` and ``lr``. Skipped calls also
-        carry ``skipped: 1.0`` and ``skip_reason`` is encoded as ``nan`` (1.0)
-        or ``spike`` (1.0) so the caller can route to wandb/tags directly.
+        ``metrics_callback`` (if set) fires on optimizer-step boundaries only
+        (successful or skipped). Returned loss value is the *un-scaled*
+        per-microbatch loss; useful for live progress logging.
         """
         self.model.train()
         batch = batch.to(self.device)
@@ -116,14 +128,29 @@ class Trainer:
             skip_reason = "spike"
 
         if skip_reason is not None:
-            # Throw away any partial graph + grads accumulated so far.
             self.optimizer.zero_grad(set_to_none=True)
             self.skipped_steps += 1
+            self._micro_step = 0
             self._fire_callback(loss_value, grad_norm=None, skip_reason=skip_reason)
             return loss_value
 
-        self.optimizer.zero_grad()
-        loss.backward()
+        # Scale and accumulate. zero_grad happens after the macro step.
+        if self.gradient_accumulation_steps > 1:
+            (loss / self.gradient_accumulation_steps).backward()
+        else:
+            self.optimizer.zero_grad()
+            loss.backward()
+
+        self._micro_step += 1
+        if self._micro_step < self.gradient_accumulation_steps:
+            # Mid-accumulation: no optimizer step, no scheduler tick, no
+            # counter increment. Caller still gets the loss back for live
+            # logging if they want to track per-microbatch progress
+            # (callback is intentionally not fired here — keeps "step" in
+            # metrics aligned with ``self.step``).
+            return loss_value
+
+        # K-th micro-step → optimizer + scheduler boundary.
         grad_norm: float | None = None
         if self.grad_clip_norm is not None:
             total_norm = torch.nn.utils.clip_grad_norm_(
@@ -131,9 +158,12 @@ class Trainer:
             )
             grad_norm = float(total_norm.detach().item()) if isinstance(total_norm, Tensor) else float(total_norm)
         self.optimizer.step()
+        if self.gradient_accumulation_steps > 1:
+            self.optimizer.zero_grad()
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
         self.step += 1
+        self._micro_step = 0
         self._recent_losses.append(loss_value)
         self._fire_callback(loss_value, grad_norm=grad_norm, skip_reason=None)
         return loss_value
