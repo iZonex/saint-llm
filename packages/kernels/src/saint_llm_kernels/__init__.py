@@ -14,6 +14,7 @@ from saint_llm_kernels.attention import (
     lightning_indexer_topk,
     lightning_indexer_topk_reference,
 )
+from saint_llm_kernels.linear_fp4 import Fp4Linear
 from saint_llm_kernels.linear_fp8 import Fp8Linear
 from saint_llm_kernels.mhc import mhc_carry, mhc_carry_reference
 from saint_llm_kernels.quant import (
@@ -29,6 +30,7 @@ from saint_llm_kernels.quant import (
 __version__ = "0.0.1"
 
 __all__ = [
+    "Fp4Linear",
     "Fp8Format",
     "Fp8Linear",
     "cast_to_fp4_mx",
