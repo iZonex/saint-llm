@@ -107,12 +107,11 @@ class TransformerBlock(nn.Module):
         *,
         kv_cache_layer: object | None = None,
     ) -> Tensor:
-        # Attention sub-block. ``kv_cache_layer`` is duck-typed (a
-        # SWAKVCacheLayer for SWA blocks, or None). CSA/HCA forward signatures
-        # don't yet accept caches — stages 3/4 — so we only pass it to
-        # SWAttention via a kwarg-aware call.
+        # Attention sub-block. ``kv_cache_layer`` is duck-typed
+        # (SWAKVCacheLayer for SWA, HCAKVCacheLayer for HCA, or None). CSA
+        # cache support lands in stage 6.
         inner_in, _, b_l, c_l = self.attn_mhc.split(x_expanded)
-        if kv_cache_layer is not None and isinstance(self.attention, SWAttention):
+        if kv_cache_layer is not None and isinstance(self.attention, SWAttention | HCA):
             attn_out = self.attention(inner_in, is_visual=is_visual, kv_cache=kv_cache_layer)
         else:
             attn_out = self.attention(inner_in, is_visual=is_visual)

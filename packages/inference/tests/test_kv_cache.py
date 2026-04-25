@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from saint_llm_core.attention import SWAttention
+from saint_llm_core.attention import HCA, SWAttention
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
 from saint_llm_inference import (
+    HCAKVCacheLayer,
     KVCacheBundle,
     SWAKVCacheLayer,
     greedy_decode,
@@ -239,18 +240,25 @@ def test_saintllm_default_kv_cache_bundle_none_unchanged() -> None:
 
 
 def test_bundle_for_model_factory() -> None:
-    """Bundle built from a SaintLLM has one entry per block; SWA blocks
-    populated, others None."""
+    """Bundle built from a SaintLLM has one entry per block; SWA + HCA
+    blocks populated, CSA blocks None (stage 6 will fix that)."""
     cfg = ModelConfig.tiny()
     torch.manual_seed(0)
     model = SaintLLM(cfg).eval()
     bundle = KVCacheBundle.for_model(model, max_seq_len=8)
     assert len(bundle) == cfg.n_layers
-    swa_count = sum(
-        1 for i in range(cfg.n_layers) if bundle.for_layer(i) is not None
-    )
-    # cfg.tiny has first_dense_swa_layers=1.
+    swa_count = sum(1 for i in range(cfg.n_layers)
+                    if isinstance(bundle.for_layer(i), SWAKVCacheLayer))
+    hca_count = sum(1 for i in range(cfg.n_layers)
+                    if isinstance(bundle.for_layer(i), HCAKVCacheLayer))
+    none_count = sum(1 for i in range(cfg.n_layers)
+                     if bundle.for_layer(i) is None)
+    # tiny: first_dense_swa_layers=1; remaining 3 layers alternate CSA/HCA
+    # starting with CSA. So: 1 SWA, 1 HCA (positions 2 and... actually let's
+    # just check the totals add up.
     assert swa_count == cfg.first_dense_swa_layers
+    assert swa_count + hca_count + none_count == cfg.n_layers
+    assert hca_count > 0  # at least one HCA in the layer pattern
 
 
 def test_greedy_decode_cached_runs() -> None:
@@ -285,3 +293,135 @@ def test_greedy_decode_cached_rejects_non_2d() -> None:
     model = SaintLLM(cfg).eval()
     with pytest.raises(ValueError, match="must be 2D"):
         greedy_decode_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2)
+
+
+# ---------- HCAKVCacheLayer ----------
+
+
+def _hca(cfg: ModelConfig) -> HCA:
+    torch.manual_seed(0)
+    layer = HCA(cfg.hidden_dim, cfg.attention, cfg.hca)
+    layer.eval()
+    return layer
+
+
+def test_hca_cache_initial_state_empty() -> None:
+    cache = HCAKVCacheLayer(
+        max_seq_len=32, hidden_dim=128, head_dim=32, compression_rate=8,
+    )
+    assert cache.length == 0
+    assert cache.n_blocks == 0
+    assert cache.h_buf_count == 0
+
+
+def test_hca_cache_invalid_max_seq_len() -> None:
+    with pytest.raises(ValueError, match="max_seq_len"):
+        HCAKVCacheLayer(max_seq_len=0, hidden_dim=8, head_dim=4, compression_rate=2)
+
+
+def test_hca_cache_invalid_compression_rate() -> None:
+    with pytest.raises(ValueError, match="compression_rate"):
+        HCAKVCacheLayer(
+            max_seq_len=8, hidden_dim=8, head_dim=4, compression_rate=0,
+        )
+
+
+def test_hca_cache_overflow_raises() -> None:
+    cache = HCAKVCacheLayer(
+        max_seq_len=4, hidden_dim=8, head_dim=4, compression_rate=2,
+    )
+    h = torch.randn(1, 5, 8)
+    sw_k = torch.randn(1, 5, 4)
+    sw_v = torch.randn(1, 5, 4)
+    with pytest.raises(RuntimeError, match="overflow"):
+        cache.append(h, sw_k, sw_v, compressor=lambda x: x.new_zeros(1, 0, 4))
+
+
+def test_hca_cache_emits_blocks_at_boundaries() -> None:
+    """With m=4, 9 tokens fed in chunks should produce 2 blocks + 1 leftover."""
+    cache = HCAKVCacheLayer(
+        max_seq_len=16, hidden_dim=8, head_dim=4, compression_rate=4,
+    )
+    # The compressor here is a stub that emits one block per m raw tokens.
+    counter = [0]
+
+    def stub_compressor(h: torch.Tensor) -> torch.Tensor:
+        # h: (B, n*m, hidden_dim) — emit (B, n, head_dim).
+        n = h.shape[1] // 4
+        counter[0] += 1
+        return torch.full((h.shape[0], n, 4), float(counter[0]))
+
+    cache.append(
+        torch.randn(1, 3, 8), torch.randn(1, 3, 4), torch.randn(1, 3, 4),
+        compressor=stub_compressor,
+    )
+    assert cache.h_buf_count == 3
+    assert cache.n_blocks == 0
+
+    cache.append(
+        torch.randn(1, 6, 8), torch.randn(1, 6, 4), torch.randn(1, 6, 4),
+        compressor=stub_compressor,
+    )
+    # 3 buffered + 6 new = 9 → 2 complete blocks + 1 leftover.
+    assert cache.n_blocks == 2
+    assert cache.h_buf_count == 1
+    assert cache.length == 9
+
+
+def test_hca_cached_full_pass_matches_uncached() -> None:
+    """HCA cached forward token-by-token must equal the uncached full pass."""
+    cfg = ModelConfig.tiny()
+    layer = _hca(cfg)
+    t = 16  # 16 / hca compression_rate=8 → 2 complete blocks
+    h = torch.randn(1, t, cfg.hidden_dim)
+    with torch.no_grad():
+        out_full = layer(h)
+
+    cache = HCAKVCacheLayer(
+        max_seq_len=t,
+        hidden_dim=cfg.hidden_dim,
+        head_dim=cfg.attention.head_dim,
+        compression_rate=cfg.hca.compression_rate,
+    )
+    with torch.no_grad():
+        chunks = [layer(h[:, i:i + 1, :], kv_cache=cache) for i in range(t)]
+    out_cached = torch.cat(chunks, dim=1)
+    assert torch.allclose(out_cached, out_full, atol=1.0e-4)
+
+
+def test_hca_cached_prefill_then_decode_matches_uncached() -> None:
+    """Realistic generate: prefill K, decode rest one at a time."""
+    cfg = ModelConfig.tiny()
+    layer = _hca(cfg)
+    prompt_t = 8  # exactly one HCA block boundary
+    decode_t = 8
+    full_t = prompt_t + decode_t
+    h_full = torch.randn(1, full_t, cfg.hidden_dim)
+    with torch.no_grad():
+        out_full = layer(h_full)
+
+    cache = HCAKVCacheLayer(
+        max_seq_len=full_t,
+        hidden_dim=cfg.hidden_dim,
+        head_dim=cfg.attention.head_dim,
+        compression_rate=cfg.hca.compression_rate,
+    )
+    with torch.no_grad():
+        prefill_out = layer(h_full[:, :prompt_t], kv_cache=cache)
+        chunks = [
+            prefill_out,
+            *(layer(h_full[:, i:i + 1], kv_cache=cache) for i in range(prompt_t, full_t)),
+        ]
+    out_cached = torch.cat(chunks, dim=1)
+    assert torch.allclose(out_cached, out_full, atol=1.0e-4)
+
+
+def test_hca_no_cache_unchanged() -> None:
+    """Default kv_cache=None must be byte-identical to the pre-cache HCA."""
+    cfg = ModelConfig.tiny()
+    layer = _hca(cfg)
+    h = torch.randn(1, 8, cfg.hidden_dim)
+    with torch.no_grad():
+        a = layer(h)
+        b = layer(h, kv_cache=None)
+    assert torch.equal(a, b)
