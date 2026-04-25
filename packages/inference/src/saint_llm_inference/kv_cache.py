@@ -8,13 +8,16 @@ Each attention variant in saint-llm has a different cache shape:
 * ``HCAKVCacheLayer`` — heavy-compressed: cache (B, n_blocks, head_dim) of
   *compressed* K/V. New tokens flow through the block-level compressor only
   on block boundaries (every ``compression_rate`` steps); in between the
-  cached compression is reused. *(stage 2 — not implemented yet)*
+  cached compression is reused. *(stage 3 — not implemented yet)*
 * ``CSAKVCacheLayer`` — compressed-sparse: same compressed-block cache as
   HCA plus the indexer's K^IComp cache + a sliding-window uncompressed cache
-  for the SWA branch. *(stage 3 — not implemented yet)*
+  for the SWA branch. *(stage 4 — not implemented yet)*
 
-This module ships stage 1: SWA only. Stages 2/3 will land here next; the
-``KVCache`` class composes per-layer entries by attention type.
+``KVCacheBundle`` composes per-layer entries (``SWAKVCacheLayer | None``)
+keyed by transformer block index. The model's forward looks up the bundle
+entry for each block and passes it to that block's attention forward;
+blocks whose attention type doesn't have a cache implementation yet
+silently no-op (the bundle entry is None).
 """
 
 from __future__ import annotations
@@ -79,3 +82,41 @@ class SWAKVCacheLayer:
     def reset(self) -> None:
         """Drop all cached entries; ready for a fresh prompt."""
         self.length = 0
+
+
+class KVCacheBundle:
+    """Per-layer KV cache container indexed by transformer block index.
+
+    Entries are typed ``SWAKVCacheLayer | None`` for now (stages 3/4 will
+    extend the union). A ``None`` entry means "this block has no cache;
+    fall back to recompute". The ``length`` property returns the global
+    decoded length tracked by any populated entry (all entries advance in
+    lockstep; SWA entries do the bookkeeping).
+    """
+
+    def __init__(self, layers: list[SWAKVCacheLayer | None]) -> None:
+        self._layers = list(layers)
+
+    def __len__(self) -> int:
+        return len(self._layers)
+
+    def for_layer(self, idx: int) -> SWAKVCacheLayer | None:
+        """Return the cache for block ``idx`` or ``None`` if uncached."""
+        return self._layers[idx]
+
+    @property
+    def length(self) -> int:
+        """Number of decoded positions cached in any populated entry.
+
+        All populated entries advance in lockstep, so the first non-None
+        entry's length is authoritative. Returns 0 when nothing is cached.
+        """
+        for layer in self._layers:
+            if layer is not None:
+                return layer.length
+        return 0
+
+    def reset(self) -> None:
+        for layer in self._layers:
+            if layer is not None:
+                layer.reset()

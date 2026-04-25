@@ -104,10 +104,18 @@ class TransformerBlock(nn.Module):
         x_expanded: Tensor,
         token_ids: Tensor,
         is_visual: Tensor | None,
+        *,
+        kv_cache_layer: object | None = None,
     ) -> Tensor:
-        # Attention sub-block
+        # Attention sub-block. ``kv_cache_layer`` is duck-typed (a
+        # SWAKVCacheLayer for SWA blocks, or None). CSA/HCA forward signatures
+        # don't yet accept caches — stages 3/4 — so we only pass it to
+        # SWAttention via a kwarg-aware call.
         inner_in, _, b_l, c_l = self.attn_mhc.split(x_expanded)
-        attn_out = self.attention(inner_in, is_visual=is_visual)
+        if kv_cache_layer is not None and isinstance(self.attention, SWAttention):
+            attn_out = self.attention(inner_in, is_visual=is_visual, kv_cache=kv_cache_layer)
+        else:
+            attn_out = self.attention(inner_in, is_visual=is_visual)
         x_expanded = self.attn_mhc.combine(x_expanded, attn_out, b_l, c_l)
 
         # MoE sub-block
@@ -214,6 +222,8 @@ class SaintLLM(nn.Module):
         vision_features: Tensor | None = None,
         audio_features: Tensor | None = None,
         is_visual: Tensor | None = None,
+        *,
+        kv_cache_bundle: object | None = None,
     ) -> dict[str, Tensor | list[Tensor]]:
         h = self._embed_inputs(token_ids, vision_features, audio_features)
         embeddings = h
@@ -224,15 +234,28 @@ class SaintLLM(nn.Module):
 
         x_expanded = MHC.expand(h, self.cfg.mhc.expansion_factor)
         use_ckpt = self.cfg.activation_checkpointing and self.training and torch.is_grad_enabled()
-        for block in self.blocks:
-            if use_ckpt:
+        for layer_idx, block in enumerate(self.blocks):
+            if use_ckpt and kv_cache_bundle is None:
+                # Activation checkpointing is incompatible with cached forward
+                # (re-running the block during backward would re-append to the
+                # cache). Skip cache when checkpointing is active.
                 x_expanded = checkpoint(
                     _CheckpointedBlock(block, token_ids, is_visual),
                     x_expanded,
                     use_reentrant=False,
                 )
             else:
-                x_expanded = block(x_expanded, token_ids=token_ids, is_visual=is_visual)
+                cache_layer = (
+                    kv_cache_bundle.for_layer(layer_idx)  # type: ignore[attr-defined]
+                    if kv_cache_bundle is not None
+                    else None
+                )
+                x_expanded = block(
+                    x_expanded,
+                    token_ids=token_ids,
+                    is_visual=is_visual,
+                    kv_cache_layer=cache_layer,
+                )
         h = MHC.collapse(x_expanded)
         h = self.final_norm(h)
 
