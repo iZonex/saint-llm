@@ -477,6 +477,58 @@ def test_grad_accum_default_is_one() -> None:
     assert trainer.step == 1
 
 
+def test_default_mixed_precision_is_none() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+    assert trainer.mixed_precision == "none"
+    assert trainer._grad_scaler is None
+
+
+def test_invalid_mixed_precision_rejected() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    with pytest.raises(ValueError, match="mixed_precision"):
+        Trainer(model, opt, loss_fn=_ce_loss_fn, mixed_precision="bf32")  # type: ignore[arg-type]
+
+
+def test_mixed_precision_no_op_on_cpu() -> None:
+    """bf16 setting on CPU shouldn't crash — autocast is silently bypassed."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn, mixed_precision="bf16", device="cpu")
+    loss = trainer.train_step(torch.zeros(1, 16, dtype=torch.long))
+    assert torch.isfinite(torch.tensor(loss))
+
+
+def test_fp16_grad_scaler_enabled_on_cuda_only() -> None:
+    """GradScaler attaches only when fp16 + CUDA. CPU+fp16 must not allocate one."""
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn, mixed_precision="fp16", device="cpu")
+    assert trainer._grad_scaler is None
+
+
+@pytest.mark.gpu
+def test_bf16_autocast_runs_on_cuda() -> None:
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+    cuda = torch.device("cuda")
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg).to(cuda)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(
+        model, opt, loss_fn=_ce_loss_fn, mixed_precision="bf16", device=cuda,
+    )
+    batch = torch.randint(0, cfg.vocab_size, (1, 16), device=cuda)
+    loss = trainer.train_step(batch)
+    assert torch.isfinite(torch.tensor(loss))
+
+
 def test_grad_accum_skip_resets_micro_step_counter() -> None:
     """A NaN skip mid-accumulation discards the partial accumulation and resets."""
     cfg = ModelConfig.tiny()

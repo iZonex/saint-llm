@@ -18,12 +18,14 @@ import math
 from collections import deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 import torch
 from torch import Tensor, nn
 
 from saint_llm_training.checkpoint import load_checkpoint, save_checkpoint
+
+MixedPrecision = Literal["none", "bf16", "fp16"]
 
 
 class _LRSchedulerLike(Protocol):
@@ -67,6 +69,7 @@ class Trainer:
         loss_spike_factor: float | None = None,
         loss_spike_window: int = 32,
         gradient_accumulation_steps: int = 1,
+        mixed_precision: MixedPrecision = "none",
         device: torch.device | str | None = None,
     ) -> None:
         if grad_clip_norm is not None and grad_clip_norm <= 0:
@@ -81,6 +84,11 @@ class Trainer:
             raise ValueError(
                 f"gradient_accumulation_steps must be > 0; got {gradient_accumulation_steps}",
             )
+        if mixed_precision not in ("none", "bf16", "fp16"):
+            raise ValueError(
+                f"mixed_precision must be one of 'none' | 'bf16' | 'fp16'; got {mixed_precision!r}",
+            )
+        self.mixed_precision = mixed_precision
         self.model = model
         self.optimizer = optimizer
         self.loss_fn = loss_fn
@@ -95,6 +103,12 @@ class Trainer:
         self.skipped_steps = 0
         self._recent_losses: deque[float] = deque(maxlen=loss_spike_window)
         self._micro_step = 0  # 0..gradient_accumulation_steps-1; resets after optimizer.step
+        # fp16 needs a GradScaler to avoid underflow during loss.backward.
+        self._grad_scaler: torch.amp.GradScaler | None = (
+            torch.amp.GradScaler(self.device.type)
+            if mixed_precision == "fp16" and self.device.type == "cuda"
+            else None
+        )
 
     def train_step(self, batch: Tensor) -> float:
         """One micro-step. Returns the (un-divided) scalar loss value.
@@ -118,7 +132,7 @@ class Trainer:
         """
         self.model.train()
         batch = batch.to(self.device)
-        loss = self.loss_fn(self.model, batch)
+        loss = self._forward_under_autocast(batch)
         loss_value = float(loss.detach().item())
 
         skip_reason: str | None = None
@@ -135,11 +149,17 @@ class Trainer:
             return loss_value
 
         # Scale and accumulate. zero_grad happens after the macro step.
-        if self.gradient_accumulation_steps > 1:
-            (loss / self.gradient_accumulation_steps).backward()
-        else:
+        scaled_loss = (
+            loss / self.gradient_accumulation_steps
+            if self.gradient_accumulation_steps > 1
+            else loss
+        )
+        if self.gradient_accumulation_steps == 1:
             self.optimizer.zero_grad()
-            loss.backward()
+        if self._grad_scaler is not None:
+            self._grad_scaler.scale(scaled_loss).backward()
+        else:
+            scaled_loss.backward()
 
         self._micro_step += 1
         if self._micro_step < self.gradient_accumulation_steps:
@@ -151,13 +171,20 @@ class Trainer:
             return loss_value
 
         # K-th micro-step → optimizer + scheduler boundary.
+        if self._grad_scaler is not None:
+            # Unscale before clip so the threshold compares to real gradients.
+            self._grad_scaler.unscale_(self.optimizer)
         grad_norm: float | None = None
         if self.grad_clip_norm is not None:
             total_norm = torch.nn.utils.clip_grad_norm_(
                 self.model.parameters(), self.grad_clip_norm,
             )
             grad_norm = float(total_norm.detach().item()) if isinstance(total_norm, Tensor) else float(total_norm)
-        self.optimizer.step()
+        if self._grad_scaler is not None:
+            self._grad_scaler.step(self.optimizer)
+            self._grad_scaler.update()
+        else:
+            self.optimizer.step()
         if self.gradient_accumulation_steps > 1:
             self.optimizer.zero_grad()
         if self.lr_scheduler is not None:
@@ -167,6 +194,20 @@ class Trainer:
         self._recent_losses.append(loss_value)
         self._fire_callback(loss_value, grad_norm=grad_norm, skip_reason=None)
         return loss_value
+
+    def _forward_under_autocast(self, batch: Tensor) -> Tensor:
+        """Compute loss, optionally inside ``torch.amp.autocast``.
+
+        bf16/fp16 only kick in on CUDA (no-op on CPU/MPS to preserve the dev
+        loop). The loss is forced to fp32 on the way out so backward and
+        scheduler arithmetic stay in fp32.
+        """
+        if self.mixed_precision == "none" or self.device.type != "cuda":
+            return self.loss_fn(self.model, batch)
+        amp_dtype = torch.bfloat16 if self.mixed_precision == "bf16" else torch.float16
+        with torch.amp.autocast(device_type="cuda", dtype=amp_dtype):
+            loss = self.loss_fn(self.model, batch)
+        return loss.float()
 
     def _is_loss_spike(self, loss_value: float) -> bool:
         """True if ``loss_value`` exceeds ``median(recent) * loss_spike_factor``.
