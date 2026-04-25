@@ -6,6 +6,8 @@ Used when no compressed branch is wanted (early layers focus on local patterns).
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
 
@@ -50,24 +52,63 @@ class SWAttention(nn.Module):
             linear_factory=linear_factory,
         )
 
-    def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:
-        b, t, _ = h.shape
+    def forward(
+        self,
+        h: Tensor,
+        is_visual: Tensor | None = None,
+        *,
+        kv_cache: Any | None = None,
+    ) -> Tensor:
+        """Sliding-window MQA attention.
+
+        When ``kv_cache`` is provided (a ``saint_llm_inference.SWAKVCacheLayer``),
+        the new tokens' K/V are appended to the cache and attention runs over
+        the full cached length with a position-aware causal+window mask. RoPE
+        is applied at the absolute position implied by the cache offset.
+
+        ``kv_cache`` is duck-typed (``length: int``, ``append(k, v) -> (K_full, V_full)``)
+        to keep ``saint_llm_core`` free of an inference-package import.
+        """
+        b, t_new, _ = h.shape
         device = h.device
         cfg = self.attn_cfg
+        cache_offset = int(kv_cache.length) if kv_cache is not None else 0
+        total_len = cache_offset + t_new
 
         c_q = self.q_compressor(h)
-        q = self.q_up(c_q).view(b, t, cfg.query_heads, cfg.head_dim).transpose(1, 2)
-        cos, sin = build_rope_cache(t, cfg.rope_dim, cfg.rope_theta, device)
-        q = apply_partial_rope(q, cos, sin, cfg.rope_dim)
+        q = self.q_up(c_q).view(b, t_new, cfg.query_heads, cfg.head_dim).transpose(1, 2)
+        cos_full, sin_full = build_rope_cache(total_len, cfg.rope_dim, cfg.rope_theta, device)
+        cos_new = cos_full[cache_offset:total_len]
+        sin_new = sin_full[cache_offset:total_len]
+        q = apply_partial_rope(q, cos_new, sin_new, cfg.rope_dim)
         q = self.q_norm(q)
 
-        k = apply_partial_rope(self.k_proj(h), cos, sin, cfg.rope_dim)
-        v = self.v_proj(h)
-        k = self.k_norm(k)
+        k_new = apply_partial_rope(self.k_proj(h), cos_new, sin_new, cfg.rope_dim)
+        v_new = self.v_proj(h)
+        k_new = self.k_norm(k_new)
 
-        mask = sliding_window_mask(t, cfg.sliding_window_size, device=device) & causal_mask(t, t, device=device)
-        k_h = k.unsqueeze(1).expand(b, cfg.query_heads, t, cfg.head_dim)
-        v_h = v.unsqueeze(1).expand(b, cfg.query_heads, t, cfg.head_dim)
+        if kv_cache is not None:
+            k, v = kv_cache.append(k_new, v_new)
+            t_keys = total_len
+        else:
+            k = k_new
+            v = v_new
+            t_keys = t_new
+
+        if cache_offset == 0:
+            mask = (
+                sliding_window_mask(t_keys, cfg.sliding_window_size, device=device)
+                & causal_mask(t_keys, t_keys, device=device)
+            )
+        else:
+            # Non-square mask: q at absolute position p_q sees k at positions
+            # in (p_q - window, p_q]. q rows index t_new; k columns index t_keys.
+            q_pos = torch.arange(cache_offset, total_len, device=device).unsqueeze(-1)
+            k_pos = torch.arange(t_keys, device=device).unsqueeze(0)
+            mask = (k_pos <= q_pos) & ((q_pos - k_pos) < cfg.sliding_window_size)
+
+        k_h = k.unsqueeze(1).expand(b, cfg.query_heads, t_keys, cfg.head_dim)
+        v_h = v.unsqueeze(1).expand(b, cfg.query_heads, t_keys, cfg.head_dim)
 
         attn_out = scaled_dot_product(q, k_h, v_h, mask=mask, sink_logit=self.sink_logit)
         return self.output(attn_out)
