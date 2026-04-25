@@ -8,6 +8,7 @@ Modules:
     quant          — FP4/FP8 cast/dequant kernels
 """
 
+from saint_llm_kernels.mhc import mhc_carry, mhc_carry_reference
 from saint_llm_kernels.quant import (
     Fp8Format,
     cast_to_fp4_mx,
@@ -28,4 +29,6 @@ __all__ = [
     "dequant_from_fp8",
     "fake_quant_fp4_mx",
     "fake_quant_fp8",
+    "mhc_carry",
+    "mhc_carry_reference",
 ]
