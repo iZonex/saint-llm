@@ -15,9 +15,16 @@ Planned:
 """
 
 from saint_llm_training.checkpoint import load_checkpoint, save_checkpoint
+from saint_llm_training.rotation import CheckpointRotator
 from saint_llm_training.schedule import warmup_cosine_schedule
 from saint_llm_training.trainer import Trainer
 
 __version__ = "0.0.1"
 
-__all__ = ["Trainer", "load_checkpoint", "save_checkpoint", "warmup_cosine_schedule"]
+__all__ = [
+    "CheckpointRotator",
+    "Trainer",
+    "load_checkpoint",
+    "save_checkpoint",
+    "warmup_cosine_schedule",
+]
