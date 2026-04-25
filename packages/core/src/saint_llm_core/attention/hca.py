@@ -43,7 +43,10 @@ class HCA(nn.Module):
         self.q_compressor = linear_factory(hidden_dim, attn.query_compression_dim, bias=False)
         self.q_up = linear_factory(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
 
-        self.kv_compressor = TokenLevelCompressor(hidden_dim, attn.head_dim, hca.compression_rate)
+        self.kv_compressor = TokenLevelCompressor(
+            hidden_dim, attn.head_dim, hca.compression_rate,
+            linear_factory=linear_factory,
+        )
         self.k_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
         self.v_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
 
@@ -58,6 +61,7 @@ class HCA(nn.Module):
 
         self.output = GroupedOutputProjection(
             hidden_dim, attn.query_heads, attn.head_dim, attn.output_proj_groups, attn.attention_intermediate_dim,
+            linear_factory=linear_factory,
         )
 
     def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:

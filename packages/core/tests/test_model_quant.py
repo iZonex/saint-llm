@@ -60,6 +60,41 @@ def test_quant_mode_swaps_attention_projections(mode: str) -> None:
     assert saw_csa_or_hca, "tiny config should have at least one CSA/HCA block"
 
 
+@pytest.mark.parametrize("mode", ["fp8", "fp4"])
+def test_quant_mode_swaps_attention_nested_helpers(mode: str) -> None:
+    """kv_compressor (TokenLevelCompressor) + output (GroupedOutputProjection)
+    in CSA/HCA/SWAttention must use the quantized linear_factory under fp8/fp4."""
+    cfg = _tiny().model_copy(update={"linear_quant": mode})
+    model = SaintLLM(cfg)
+    for block in model.blocks:
+        attn = block.attention
+        # GroupedOutputProjection is shared by all attention types.
+        out = attn.output
+        assert type(out.final_proj) is not nn.Linear
+        for proj in out.group_projs:
+            assert type(proj) is not nn.Linear
+        # kv_compressor only exists on CSA/HCA, not SWAttention.
+        kv = getattr(attn, "kv_compressor", None)
+        if kv is not None:
+            for attr in ("w_a_kv", "w_b_kv", "w_a_z", "w_b_z"):
+                layer = getattr(kv, attr)
+                assert type(layer) is not nn.Linear, f"kv_compressor.{attr} not swapped"
+
+
+def test_indexer_nested_compressor_stays_unquantized() -> None:
+    """LightningIndexer's nested TokenLevelCompressor must stay nn.Linear —
+    quant noise on indexer scores would destabilize routing."""
+    cfg = _tiny().model_copy(update={"linear_quant": "fp8"})
+    model = SaintLLM(cfg)
+    csa_block = next(b for b in model.blocks if type(b.attention).__name__ == "CSA")
+    indexer = csa_block.attention.indexer
+    for attr in ("w_a_kv", "w_b_kv", "w_a_z", "w_b_z"):
+        layer = getattr(indexer.compressor, attr)
+        assert type(layer) is nn.Linear, f"indexer.compressor.{attr} should stay nn.Linear"
+    for attr in ("w_dq", "w_iuq", "w_w"):
+        assert type(getattr(indexer, attr)) is nn.Linear
+
+
 @pytest.mark.parametrize("mode", ["bf16", "fp8", "fp4"])
 def test_forward_finite_in_each_quant_mode(mode: str) -> None:
     """End-to-end: SaintLLM forward in each quant mode produces a finite logits tensor."""

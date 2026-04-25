@@ -47,6 +47,7 @@ class SWAttention(nn.Module):
 
         self.output = GroupedOutputProjection(
             hidden_dim, attn.query_heads, attn.head_dim, attn.output_proj_groups, attn.attention_intermediate_dim,
+            linear_factory=linear_factory,
         )
 
     def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:

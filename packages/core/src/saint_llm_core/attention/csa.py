@@ -43,14 +43,21 @@ class TokenLevelCompressor(nn.Module):
     softmax-normalized weights with learnable positional biases B^a, B^b.
     """
 
-    def __init__(self, hidden_dim: int, c: int, m: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        c: int,
+        m: int,
+        *,
+        linear_factory: LinearFactory = _default_linear,
+    ) -> None:
         super().__init__()
         self.c = c
         self.m = m
-        self.w_a_kv = nn.Linear(hidden_dim, c, bias=False)
-        self.w_b_kv = nn.Linear(hidden_dim, c, bias=False)
-        self.w_a_z = nn.Linear(hidden_dim, c, bias=False)
-        self.w_b_z = nn.Linear(hidden_dim, c, bias=False)
+        self.w_a_kv = linear_factory(hidden_dim, c, bias=False)
+        self.w_b_kv = linear_factory(hidden_dim, c, bias=False)
+        self.w_a_z = linear_factory(hidden_dim, c, bias=False)
+        self.w_b_z = linear_factory(hidden_dim, c, bias=False)
         self.bias_a = nn.Parameter(torch.zeros(m, c))
         self.bias_b = nn.Parameter(torch.zeros(m, c))
 
@@ -150,7 +157,16 @@ class LightningIndexer(nn.Module):
 class GroupedOutputProjection(nn.Module):
     """Split per-head outputs into g groups, project each into d_g, concat → hidden_dim."""
 
-    def __init__(self, hidden_dim: int, n_heads: int, head_dim: int, n_groups: int, d_g: int) -> None:
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_heads: int,
+        head_dim: int,
+        n_groups: int,
+        d_g: int,
+        *,
+        linear_factory: LinearFactory = _default_linear,
+    ) -> None:
         super().__init__()
         assert n_heads % n_groups == 0
         self.n_groups = n_groups
@@ -158,9 +174,9 @@ class GroupedOutputProjection(nn.Module):
         self.d_g = d_g
         per_group_in = self.heads_per_group * head_dim
         self.group_projs = nn.ModuleList(
-            nn.Linear(per_group_in, d_g, bias=False) for _ in range(n_groups)
+            linear_factory(per_group_in, d_g, bias=False) for _ in range(n_groups)
         )
-        self.final_proj = nn.Linear(n_groups * d_g, hidden_dim, bias=False)
+        self.final_proj = linear_factory(n_groups * d_g, hidden_dim, bias=False)
 
     def forward(self, attn_out: Tensor) -> Tensor:
         b, n_heads, t, head_dim = attn_out.shape
@@ -193,11 +209,16 @@ class CSA(nn.Module):
         self.q_compressor = linear_factory(hidden_dim, attn.query_compression_dim, bias=False)
         self.q_up = linear_factory(attn.query_compression_dim, attn.query_heads * attn.head_dim, bias=False)
 
-        self.kv_compressor = TokenLevelCompressor(hidden_dim, attn.head_dim, csa.compression_rate)
+        self.kv_compressor = TokenLevelCompressor(
+            hidden_dim, attn.head_dim, csa.compression_rate,
+            linear_factory=linear_factory,
+        )
         # Sliding-window KV path (uncompressed, shared across heads — MQA).
         self.k_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
         self.v_proj = linear_factory(hidden_dim, attn.head_dim, bias=False)
 
+        # Indexer keeps default (nn.Linear) — quantization noise on its scores
+        # would destabilize top-k routing.
         self.indexer = LightningIndexer(
             hidden_dim,
             csa.indexer_head_dim,
@@ -217,6 +238,7 @@ class CSA(nn.Module):
 
         self.output = GroupedOutputProjection(
             hidden_dim, attn.query_heads, attn.head_dim, attn.output_proj_groups, attn.attention_intermediate_dim,
+            linear_factory=linear_factory,
         )
 
     def _project_q(self, h: Tensor) -> Tensor:
