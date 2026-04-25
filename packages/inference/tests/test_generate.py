@@ -14,7 +14,7 @@ from saint_llm_inference import (
     top_p_sample,
     top_p_sample_cached,
 )
-from saint_llm_inference.generate import _filter_top_p
+from saint_llm_inference.generate import _apply_repetition_penalty, _filter_top_p
 
 
 @pytest.fixture(scope="module")
@@ -254,3 +254,56 @@ def test_cached_samplers_reject_invalid_args(model: SaintLLM) -> None:
         top_k_sample_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2, k=10)
     with pytest.raises(ValueError, match="must be 2D"):
         top_p_sample_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2, p=0.9)
+
+
+def test_repetition_penalty_helper_no_op_at_one() -> None:
+    """penalty=1.0 short-circuits to identity."""
+    logits = torch.tensor([[1.0, -2.0, 3.0, 4.0]])
+    history = torch.tensor([[0, 2]])
+    out = _apply_repetition_penalty(logits, history, 1.0)
+    assert torch.equal(out, logits)
+
+
+def test_repetition_penalty_helper_divides_positive_multiplies_negative() -> None:
+    """For positive logit a, output is a/penalty; for negative, a*penalty."""
+    logits = torch.tensor([[1.0, -2.0, 3.0, 4.0]])
+    history = torch.tensor([[0, 1]])  # repeat tokens 0 (pos) and 1 (neg)
+    out = _apply_repetition_penalty(logits, history, 2.0)
+    assert out[0, 0].item() == pytest.approx(0.5)   # 1.0 / 2.0
+    assert out[0, 1].item() == pytest.approx(-4.0)  # -2.0 * 2.0
+    assert out[0, 2].item() == 3.0                  # not in history
+    assert out[0, 3].item() == 4.0                  # not in history
+
+
+def test_top_k_sample_with_repetition_penalty_runs(model: SaintLLM) -> None:
+    """Sanity: penalty kwarg threads through without breaking the loop."""
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    g = torch.Generator().manual_seed(0)
+    out = top_k_sample(
+        model, prompt, max_new_tokens=4, k=10, temperature=1.0,
+        repetition_penalty=1.5, generator=g,
+    )
+    assert out.shape == (1, 8)
+    assert torch.isfinite(out.float()).all()
+
+
+def test_top_p_sample_cached_with_repetition_penalty_runs(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    g = torch.Generator().manual_seed(0)
+    out = top_p_sample_cached(
+        model, prompt, max_new_tokens=4, p=0.9,
+        repetition_penalty=1.5, generator=g,
+    )
+    assert out.shape == (1, 8)
+
+
+def test_repetition_penalty_rejects_non_positive(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        top_k_sample(model, prompt, max_new_tokens=2, k=10, repetition_penalty=0.0)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        top_p_sample(model, prompt, max_new_tokens=2, p=0.9, repetition_penalty=-0.5)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        top_k_sample_cached(model, prompt, max_new_tokens=2, k=10, repetition_penalty=0.0)
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        top_p_sample_cached(model, prompt, max_new_tokens=2, p=0.9, repetition_penalty=-0.5)

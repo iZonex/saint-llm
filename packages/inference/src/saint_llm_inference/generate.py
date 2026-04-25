@@ -137,6 +137,7 @@ def top_k_sample(
     temperature: float = 1.0,
     eos_token: int | None = None,
     generator: torch.Generator | None = None,
+    repetition_penalty: float | None = None,
 ) -> Tensor:
     """Top-k temperature sampling.
 
@@ -155,6 +156,8 @@ def top_k_sample(
         raise ValueError(f"k must be positive; got {k}")
     if temperature < 0.0:
         raise ValueError(f"temperature must be ≥ 0; got {temperature}")
+    if repetition_penalty is not None and repetition_penalty <= 0.0:
+        raise ValueError(f"repetition_penalty must be > 0 when set; got {repetition_penalty}")
 
     if temperature < 1.0e-8:
         return greedy_decode(model, prompt_ids, max_new_tokens=max_new_tokens, eos_token=eos_token)
@@ -166,6 +169,8 @@ def top_k_sample(
         logits = out["logits"]
         assert isinstance(logits, Tensor)
         last = logits[:, -1, :] / temperature  # (B, V)
+        if repetition_penalty is not None:
+            last = _apply_repetition_penalty(last, tokens, repetition_penalty)
         k_eff = min(k, last.shape[-1])
         top_vals, top_idx = last.topk(k_eff, dim=-1)
         probs = torch.softmax(top_vals, dim=-1)
@@ -194,6 +199,7 @@ def top_k_sample_cached(
     eos_token: int | None = None,
     generator: torch.Generator | None = None,
     bundle: KVCacheBundle | None = None,
+    repetition_penalty: float | None = None,
 ) -> Tensor:
     """Top-k sampling with KV cache (mirror of ``top_k_sample``).
 
@@ -207,6 +213,8 @@ def top_k_sample_cached(
         raise ValueError(f"k must be positive; got {k}")
     if temperature < 0.0:
         raise ValueError(f"temperature must be ≥ 0; got {temperature}")
+    if repetition_penalty is not None and repetition_penalty <= 0.0:
+        raise ValueError(f"repetition_penalty must be > 0 when set; got {repetition_penalty}")
 
     if temperature < 1.0e-8:
         return greedy_decode_cached(
@@ -225,6 +233,8 @@ def top_k_sample_cached(
 
     out = model(prompt_ids, kv_cache_bundle=bundle)
     last = out["logits"][:, -1, :] / temperature
+    if repetition_penalty is not None:
+        last = _apply_repetition_penalty(last, prompt_ids, repetition_penalty)
     next_token = _sample_top_k(last, k=k, generator=generator)
     tokens = torch.cat([prompt_ids, next_token], dim=-1)
 
@@ -243,6 +253,8 @@ def top_k_sample_cached(
     for _ in range(max_new_tokens - 1):
         out = model(tokens[:, -1:], kv_cache_bundle=bundle)
         last = out["logits"][:, -1, :] / temperature
+        if repetition_penalty is not None:
+            last = _apply_repetition_penalty(last, tokens, repetition_penalty)
         next_token = _sample_top_k(last, k=k, generator=generator)
         tokens = torch.cat([tokens, next_token], dim=-1)
         if eos_token is not None:
@@ -262,6 +274,34 @@ def _sample_top_k(last_logits: Tensor, *, k: int, generator: torch.Generator | N
     probs = torch.softmax(top_vals, dim=-1)
     sampled = torch.multinomial(probs, num_samples=1, generator=generator)
     return top_idx.gather(-1, sampled)
+
+
+def _apply_repetition_penalty(
+    logits: Tensor,
+    generated_ids: Tensor,
+    penalty: float,
+) -> Tensor:
+    """HF-style repetition penalty.
+
+    For each (batch, vocab) entry, look up tokens already present in the
+    corresponding row of ``generated_ids`` and rescale their logits:
+    positive logits are divided by ``penalty``, negative logits are
+    multiplied by ``penalty``. ``penalty > 1`` discourages repeats;
+    ``penalty == 1`` is a no-op.
+
+    ``logits`` shape (B, V); ``generated_ids`` shape (B, T_so_far).
+    """
+    if penalty == 1.0:
+        return logits
+    # Gather the logits of tokens currently in each row's history.
+    # gen shape (B, T_so_far); index into logits along dim -1.
+    gathered = torch.gather(logits, -1, generated_ids)
+    rescaled = torch.where(
+        gathered > 0,
+        gathered / penalty,
+        gathered * penalty,
+    )
+    return logits.scatter(-1, generated_ids, rescaled)
 
 
 def _filter_top_p(logits: Tensor, p: float) -> Tensor:
@@ -295,6 +335,7 @@ def top_p_sample_cached(
     eos_token: int | None = None,
     generator: torch.Generator | None = None,
     bundle: KVCacheBundle | None = None,
+    repetition_penalty: float | None = None,
 ) -> Tensor:
     """Nucleus (top-p) sampling with KV cache (mirror of ``top_p_sample``)."""
     if prompt_ids.dim() != 2:
@@ -305,6 +346,8 @@ def top_p_sample_cached(
         raise ValueError(f"p must be in (0, 1]; got {p}")
     if top_k is not None and top_k <= 0:
         raise ValueError(f"top_k must be positive when set; got {top_k}")
+    if repetition_penalty is not None and repetition_penalty <= 0.0:
+        raise ValueError(f"repetition_penalty must be > 0 when set; got {repetition_penalty}")
 
     if temperature < 1.0e-8:
         return greedy_decode_cached(
@@ -321,8 +364,10 @@ def top_p_sample_cached(
             model, max_seq_len=capacity, batch_size=b, device=prompt_ids.device,
         )
 
-    def _sample(last_logits: Tensor) -> Tensor:
+    def _sample(last_logits: Tensor, history: Tensor) -> Tensor:
         ll = last_logits / temperature
+        if repetition_penalty is not None:
+            ll = _apply_repetition_penalty(ll, history, repetition_penalty)
         if top_k is not None:
             k_eff = min(top_k, ll.shape[-1])
             cutoff = ll.topk(k_eff, dim=-1).values[..., -1:]
@@ -333,7 +378,7 @@ def top_p_sample_cached(
         return torch.multinomial(probs, num_samples=1, generator=generator)
 
     out = model(prompt_ids, kv_cache_bundle=bundle)
-    next_token = _sample(out["logits"][:, -1, :])
+    next_token = _sample(out["logits"][:, -1, :], prompt_ids)
     tokens = torch.cat([prompt_ids, next_token], dim=-1)
 
     seen_eos = (
@@ -350,7 +395,7 @@ def top_p_sample_cached(
 
     for _ in range(max_new_tokens - 1):
         out = model(tokens[:, -1:], kv_cache_bundle=bundle)
-        next_token = _sample(out["logits"][:, -1, :])
+        next_token = _sample(out["logits"][:, -1, :], tokens)
         tokens = torch.cat([tokens, next_token], dim=-1)
         if eos_token is not None:
             seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
@@ -374,6 +419,7 @@ def top_p_sample(
     top_k: int | None = None,
     eos_token: int | None = None,
     generator: torch.Generator | None = None,
+    repetition_penalty: float | None = None,
 ) -> Tensor:
     """Nucleus (top-p) sampling, optionally combined with a top-k cap.
 
@@ -394,6 +440,8 @@ def top_p_sample(
         raise ValueError(f"p must be in (0, 1]; got {p}")
     if top_k is not None and top_k <= 0:
         raise ValueError(f"top_k must be positive when set; got {top_k}")
+    if repetition_penalty is not None and repetition_penalty <= 0.0:
+        raise ValueError(f"repetition_penalty must be > 0 when set; got {repetition_penalty}")
 
     if temperature < 1.0e-8:
         return greedy_decode(model, prompt_ids, max_new_tokens=max_new_tokens, eos_token=eos_token)
@@ -405,6 +453,8 @@ def top_p_sample(
         logits = out["logits"]
         assert isinstance(logits, Tensor)
         last = logits[:, -1, :] / temperature
+        if repetition_penalty is not None:
+            last = _apply_repetition_penalty(last, tokens, repetition_penalty)
 
         if top_k is not None:
             k_eff = min(top_k, last.shape[-1])
