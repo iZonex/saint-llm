@@ -121,10 +121,12 @@ class ModelConfig(BaseModel):
 
     # Linear-layer quantization for QAT-style training.
     # bf16: standard nn.Linear (no quant). fp8: E4M3 with STE (Fp8Linear).
-    # fp4:  MXFP4 E2M1 block-32 with STE (Fp4Linear). Applied to MoE expert
-    # SwiGLU projections; other Linears (router, lm_head, attention) stay bf16.
+    # fp4:  MXFP4 E2M1 block-32 with STE (Fp4Linear).
     linear_quant: Literal["bf16", "fp8", "fp4"] = "bf16"
     fp4_block_size: int = 32
+    # When linear_quant=="fp8" and we're on Ada sm89+, swap fake-quant + F.linear
+    # for a real torch._scaled_mm call. Falls back transparently on CPU / older GPUs.
+    fp8_use_real_gemm: bool = False
 
     @classmethod
     def v4_flash(cls) -> ModelConfig:

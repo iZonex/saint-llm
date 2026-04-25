@@ -111,7 +111,11 @@ class SaintLLM(nn.Module):
             cfg.multimodal.audio_input_dim, cfg.hidden_dim, enabled=cfg.multimodal.enable_audio_projector,
         )
 
-        linear_factory = make_linear_factory(cfg.linear_quant, fp4_block_size=cfg.fp4_block_size)
+        linear_factory = make_linear_factory(
+            cfg.linear_quant,
+            fp4_block_size=cfg.fp4_block_size,
+            fp8_use_real_gemm=cfg.fp8_use_real_gemm,
+        )
         self.blocks = nn.ModuleList(
             TransformerBlock(cfg, i, linear_factory=linear_factory) for i in range(cfg.n_layers)
         )

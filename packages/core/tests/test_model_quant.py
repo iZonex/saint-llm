@@ -8,7 +8,7 @@ from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
 from saint_llm_core.moe import SwiGLU
 from saint_llm_core.quant import make_linear_factory
-from saint_llm_kernels import Fp4Linear
+from saint_llm_kernels import Fp4Linear, Fp8Linear
 from torch import nn
 
 
@@ -135,3 +135,27 @@ def test_fp4_block_size_propagates_to_factory() -> None:
     first_expert = model.blocks[0].moe.routed_experts[0]
     assert isinstance(first_expert.gate_proj, Fp4Linear)
     assert first_expert.gate_proj.block_size == 16
+
+
+def test_fp8_use_real_gemm_default_false() -> None:
+    """Default config does not opt into _scaled_mm — preserves CPU/Mac behavior."""
+    cfg = _tiny().model_copy(update={"linear_quant": "fp8"})
+    model = SaintLLM(cfg)
+    first_expert = model.blocks[0].moe.routed_experts[0]
+    assert isinstance(first_expert.gate_proj, Fp8Linear)
+    assert first_expert.gate_proj.use_real_fp8_gemm is False
+
+
+def test_fp8_use_real_gemm_propagates_to_layers() -> None:
+    cfg = _tiny().model_copy(update={"linear_quant": "fp8", "fp8_use_real_gemm": True})
+    model = SaintLLM(cfg)
+    first_expert = model.blocks[0].moe.routed_experts[0]
+    assert isinstance(first_expert.gate_proj, Fp8Linear)
+    assert first_expert.gate_proj.use_real_fp8_gemm is True
+    # Attention top-level Linears should also flip the flag.
+    for block in model.blocks:
+        attn = block.attention
+        for attr in ("q_compressor", "q_up", "k_proj", "v_proj"):
+            layer = getattr(attn, attr)
+            assert isinstance(layer, Fp8Linear)
+            assert layer.use_real_fp8_gemm is True

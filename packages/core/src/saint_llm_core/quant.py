@@ -30,18 +30,25 @@ def make_linear_factory(
     mode: LinearQuantMode,
     *,
     fp4_block_size: int = 32,
+    fp8_use_real_gemm: bool = False,
 ) -> LinearFactory:
     """Build a LinearFactory for the configured quant mode."""
     if mode == "bf16":
         return _bf16_factory
     if mode == "fp8":
+        use_real_gemm = fp8_use_real_gemm
+
         def fp8_factory(
             in_features: int,
             out_features: int,
             *,
             bias: bool = True,
         ) -> nn.Module:
-            return Fp8Linear(in_features, out_features, bias=bias)
+            return Fp8Linear(
+                in_features, out_features,
+                bias=bias,
+                use_real_fp8_gemm=use_real_gemm,
+            )
 
         return fp8_factory
     if mode == "fp4":

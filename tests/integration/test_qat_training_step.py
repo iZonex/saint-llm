@@ -17,6 +17,7 @@ import torch
 import torch.nn.functional as F
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
+from saint_llm_kernels import is_fp8_gemm_supported
 
 
 def _fixed_token_batch(cfg: ModelConfig, *, seed: int = 0) -> torch.Tensor:
@@ -52,6 +53,28 @@ def test_loss_decreases_over_a_few_steps(mode: str) -> None:
 
     assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), losses
     assert losses[-1] < losses[0], f"loss did not decrease in {mode}: {losses}"
+
+
+@pytest.mark.gpu
+def test_loss_decreases_with_real_fp8_gemm() -> None:
+    """End-to-end: SaintLLM trains under fp8 + use_real_fp8_gemm on Ada+."""
+    if not is_fp8_gemm_supported():
+        pytest.skip("FP8 GEMM not supported on this device")
+
+    torch.manual_seed(0)
+    cfg = ModelConfig.tiny().model_copy(
+        update={"linear_quant": "fp8", "fp8_use_real_gemm": True},
+    )
+    cuda = torch.device("cuda")
+    model = SaintLLM(cfg).to(cuda)
+    model.train()
+
+    optim = torch.optim.AdamW(model.parameters(), lr=3.0e-3)
+    token_ids = _fixed_token_batch(cfg).to(cuda)
+
+    losses = [_train_step_loss(model, token_ids, optim) for _ in range(4)]
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), losses
+    assert losses[-1] < losses[0], f"loss did not decrease with real fp8 GEMM: {losses}"
 
 
 @pytest.mark.parametrize("mode", ["fp8", "fp4"])
