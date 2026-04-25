@@ -15,7 +15,9 @@ from saint_llm_inference.generate import (
     greedy_decode,
     greedy_decode_cached,
     top_k_sample,
+    top_k_sample_cached,
     top_p_sample,
+    top_p_sample_cached,
 )
 from saint_llm_inference.kv_cache import KVCacheBundle, SWAKVCacheLayer
 
@@ -27,5 +29,7 @@ __all__ = [
     "greedy_decode",
     "greedy_decode_cached",
     "top_k_sample",
+    "top_k_sample_cached",
     "top_p_sample",
+    "top_p_sample_cached",
 ]

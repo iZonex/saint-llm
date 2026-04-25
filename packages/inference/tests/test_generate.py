@@ -6,7 +6,14 @@ import pytest
 import torch
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
-from saint_llm_inference import greedy_decode, top_k_sample, top_p_sample
+from saint_llm_inference import (
+    greedy_decode,
+    greedy_decode_cached,
+    top_k_sample,
+    top_k_sample_cached,
+    top_p_sample,
+    top_p_sample_cached,
+)
 from saint_llm_inference.generate import _filter_top_p
 
 
@@ -193,3 +200,57 @@ def test_top_p_rejects_invalid_args(model: SaintLLM) -> None:
         top_p_sample(model, prompt, max_new_tokens=2, p=0.9, top_k=0)
     with pytest.raises(ValueError, match="must be 2D"):
         top_p_sample(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2, p=0.9)
+
+
+def test_top_k_sample_cached_output_shape(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    out = top_k_sample_cached(model, prompt, max_new_tokens=6, k=10)
+    assert out.shape == (1, 10)
+    assert out.dtype == torch.long
+    assert torch.equal(out[:, :4], prompt)
+
+
+def test_top_k_sample_cached_deterministic(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    g1 = torch.Generator().manual_seed(7)
+    g2 = torch.Generator().manual_seed(7)
+    a = top_k_sample_cached(model, prompt, max_new_tokens=6, k=10, generator=g1)
+    b = top_k_sample_cached(model, prompt, max_new_tokens=6, k=10, generator=g2)
+    assert torch.equal(a, b)
+
+
+def test_top_k_sample_cached_zero_temp_falls_back_to_greedy(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    greedy_out = greedy_decode_cached(model, prompt, max_new_tokens=6)
+    sampled = top_k_sample_cached(
+        model, prompt, max_new_tokens=6, k=10, temperature=0.0,
+    )
+    assert torch.equal(greedy_out, sampled)
+
+
+def test_top_p_sample_cached_output_shape(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    out = top_p_sample_cached(model, prompt, max_new_tokens=6, p=0.9)
+    assert out.shape == (1, 10)
+    assert torch.equal(out[:, :4], prompt)
+
+
+def test_top_p_sample_cached_deterministic(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    g1 = torch.Generator().manual_seed(11)
+    g2 = torch.Generator().manual_seed(11)
+    a = top_p_sample_cached(model, prompt, max_new_tokens=6, p=0.9, generator=g1)
+    b = top_p_sample_cached(model, prompt, max_new_tokens=6, p=0.9, generator=g2)
+    assert torch.equal(a, b)
+
+
+def test_cached_samplers_reject_invalid_args(model: SaintLLM) -> None:
+    prompt = torch.zeros(1, 4, dtype=torch.long)
+    with pytest.raises(ValueError, match="k must be positive"):
+        top_k_sample_cached(model, prompt, max_new_tokens=2, k=0)
+    with pytest.raises(ValueError, match="p must be in"):
+        top_p_sample_cached(model, prompt, max_new_tokens=2, p=1.5)
+    with pytest.raises(ValueError, match="must be 2D"):
+        top_k_sample_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2, k=10)
+    with pytest.raises(ValueError, match="must be 2D"):
+        top_p_sample_cached(model, torch.zeros(4, dtype=torch.long), max_new_tokens=2, p=0.9)

@@ -183,6 +183,87 @@ def top_k_sample(
     return tokens
 
 
+@torch.no_grad()
+def top_k_sample_cached(
+    model: SaintLLM,
+    prompt_ids: Tensor,
+    *,
+    max_new_tokens: int,
+    k: int = 50,
+    temperature: float = 1.0,
+    eos_token: int | None = None,
+    generator: torch.Generator | None = None,
+    bundle: KVCacheBundle | None = None,
+) -> Tensor:
+    """Top-k sampling with KV cache (mirror of ``top_k_sample``).
+
+    Same arg validation; ``temperature == 0`` falls back to
+    ``greedy_decode_cached``. Uses the supplied bundle if any, else builds
+    one for ``prompt_len + max_new_tokens``.
+    """
+    if prompt_ids.dim() != 2:
+        raise ValueError(f"prompt_ids must be 2D (B, T); got shape {tuple(prompt_ids.shape)}")
+    if k <= 0:
+        raise ValueError(f"k must be positive; got {k}")
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be ≥ 0; got {temperature}")
+
+    if temperature < 1.0e-8:
+        return greedy_decode_cached(
+            model, prompt_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token=eos_token,
+            bundle=bundle,
+        )
+
+    b, prompt_t = prompt_ids.shape
+    capacity = prompt_t + max_new_tokens
+    if bundle is None:
+        bundle = KVCacheBundle.for_model(
+            model, max_seq_len=capacity, batch_size=b, device=prompt_ids.device,
+        )
+
+    out = model(prompt_ids, kv_cache_bundle=bundle)
+    last = out["logits"][:, -1, :] / temperature
+    next_token = _sample_top_k(last, k=k, generator=generator)
+    tokens = torch.cat([prompt_ids, next_token], dim=-1)
+
+    seen_eos = (
+        torch.zeros(b, dtype=torch.bool, device=prompt_ids.device)
+        if eos_token is None
+        else (next_token.squeeze(-1) == eos_token)
+    )
+    if eos_token is not None and bool(seen_eos.all().item()):
+        pad = max_new_tokens - 1
+        if pad > 0:
+            pad_tensor = next_token.new_full((b, pad), eos_token)
+            tokens = torch.cat([tokens, pad_tensor], dim=-1)
+        return tokens
+
+    for _ in range(max_new_tokens - 1):
+        out = model(tokens[:, -1:], kv_cache_bundle=bundle)
+        last = out["logits"][:, -1, :] / temperature
+        next_token = _sample_top_k(last, k=k, generator=generator)
+        tokens = torch.cat([tokens, next_token], dim=-1)
+        if eos_token is not None:
+            seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
+            if bool(seen_eos.all().item()):
+                pad = capacity - tokens.shape[1]
+                if pad > 0:
+                    pad_tensor = next_token.new_full((b, pad), eos_token)
+                    tokens = torch.cat([tokens, pad_tensor], dim=-1)
+                break
+    return tokens
+
+
+def _sample_top_k(last_logits: Tensor, *, k: int, generator: torch.Generator | None) -> Tensor:
+    k_eff = min(k, last_logits.shape[-1])
+    top_vals, top_idx = last_logits.topk(k_eff, dim=-1)
+    probs = torch.softmax(top_vals, dim=-1)
+    sampled = torch.multinomial(probs, num_samples=1, generator=generator)
+    return top_idx.gather(-1, sampled)
+
+
 def _filter_top_p(logits: Tensor, p: float) -> Tensor:
     """Mask out tokens outside the smallest-cumulative-mass-≤-p nucleus.
 
@@ -200,6 +281,86 @@ def _filter_top_p(logits: Tensor, p: float) -> Tensor:
     keep = torch.zeros_like(sorted_keep)
     keep.scatter_(-1, sorted_idx, sorted_keep)
     return logits.masked_fill(~keep, float("-inf"))
+
+
+@torch.no_grad()
+def top_p_sample_cached(
+    model: SaintLLM,
+    prompt_ids: Tensor,
+    *,
+    max_new_tokens: int,
+    p: float = 0.9,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    eos_token: int | None = None,
+    generator: torch.Generator | None = None,
+    bundle: KVCacheBundle | None = None,
+) -> Tensor:
+    """Nucleus (top-p) sampling with KV cache (mirror of ``top_p_sample``)."""
+    if prompt_ids.dim() != 2:
+        raise ValueError(f"prompt_ids must be 2D (B, T); got shape {tuple(prompt_ids.shape)}")
+    if temperature < 0.0:
+        raise ValueError(f"temperature must be ≥ 0; got {temperature}")
+    if not (0.0 < p <= 1.0):
+        raise ValueError(f"p must be in (0, 1]; got {p}")
+    if top_k is not None and top_k <= 0:
+        raise ValueError(f"top_k must be positive when set; got {top_k}")
+
+    if temperature < 1.0e-8:
+        return greedy_decode_cached(
+            model, prompt_ids,
+            max_new_tokens=max_new_tokens,
+            eos_token=eos_token,
+            bundle=bundle,
+        )
+
+    b, prompt_t = prompt_ids.shape
+    capacity = prompt_t + max_new_tokens
+    if bundle is None:
+        bundle = KVCacheBundle.for_model(
+            model, max_seq_len=capacity, batch_size=b, device=prompt_ids.device,
+        )
+
+    def _sample(last_logits: Tensor) -> Tensor:
+        ll = last_logits / temperature
+        if top_k is not None:
+            k_eff = min(top_k, ll.shape[-1])
+            cutoff = ll.topk(k_eff, dim=-1).values[..., -1:]
+            ll = torch.where(ll < cutoff, ll.new_full((), float("-inf")), ll)
+        if p < 1.0:
+            ll = _filter_top_p(ll, p)
+        probs = torch.softmax(ll, dim=-1)
+        return torch.multinomial(probs, num_samples=1, generator=generator)
+
+    out = model(prompt_ids, kv_cache_bundle=bundle)
+    next_token = _sample(out["logits"][:, -1, :])
+    tokens = torch.cat([prompt_ids, next_token], dim=-1)
+
+    seen_eos = (
+        torch.zeros(b, dtype=torch.bool, device=prompt_ids.device)
+        if eos_token is None
+        else (next_token.squeeze(-1) == eos_token)
+    )
+    if eos_token is not None and bool(seen_eos.all().item()):
+        pad = max_new_tokens - 1
+        if pad > 0:
+            pad_tensor = next_token.new_full((b, pad), eos_token)
+            tokens = torch.cat([tokens, pad_tensor], dim=-1)
+        return tokens
+
+    for _ in range(max_new_tokens - 1):
+        out = model(tokens[:, -1:], kv_cache_bundle=bundle)
+        next_token = _sample(out["logits"][:, -1, :])
+        tokens = torch.cat([tokens, next_token], dim=-1)
+        if eos_token is not None:
+            seen_eos = seen_eos | (next_token.squeeze(-1) == eos_token)
+            if bool(seen_eos.all().item()):
+                pad = capacity - tokens.shape[1]
+                if pad > 0:
+                    pad_tensor = next_token.new_full((b, pad), eos_token)
+                    tokens = torch.cat([tokens, pad_tensor], dim=-1)
+                break
+    return tokens
 
 
 @torch.no_grad()
