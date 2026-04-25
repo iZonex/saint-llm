@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import pytest
 import torch
-from saint_llm_core.attention import HCA, SWAttention
+from saint_llm_core.attention import CSA, HCA, SWAttention
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.model import SaintLLM
 from saint_llm_inference import (
+    CSAKVCacheLayer,
     HCAKVCacheLayer,
     KVCacheBundle,
     SWAKVCacheLayer,
@@ -240,8 +241,8 @@ def test_saintllm_default_kv_cache_bundle_none_unchanged() -> None:
 
 
 def test_bundle_for_model_factory() -> None:
-    """Bundle built from a SaintLLM has one entry per block; SWA + HCA
-    blocks populated, CSA blocks None (stage 6 will fix that)."""
+    """Bundle built from a SaintLLM has one cache per block (SWA + HCA + CSA
+    all supported in stage 6+)."""
     cfg = ModelConfig.tiny()
     torch.manual_seed(0)
     model = SaintLLM(cfg).eval()
@@ -251,14 +252,12 @@ def test_bundle_for_model_factory() -> None:
                     if isinstance(bundle.for_layer(i), SWAKVCacheLayer))
     hca_count = sum(1 for i in range(cfg.n_layers)
                     if isinstance(bundle.for_layer(i), HCAKVCacheLayer))
-    none_count = sum(1 for i in range(cfg.n_layers)
-                     if bundle.for_layer(i) is None)
-    # tiny: first_dense_swa_layers=1; remaining 3 layers alternate CSA/HCA
-    # starting with CSA. So: 1 SWA, 1 HCA (positions 2 and... actually let's
-    # just check the totals add up.
+    csa_count = sum(1 for i in range(cfg.n_layers)
+                    if isinstance(bundle.for_layer(i), CSAKVCacheLayer))
     assert swa_count == cfg.first_dense_swa_layers
-    assert swa_count + hca_count + none_count == cfg.n_layers
-    assert hca_count > 0  # at least one HCA in the layer pattern
+    assert hca_count > 0
+    assert csa_count > 0
+    assert swa_count + hca_count + csa_count == cfg.n_layers
 
 
 def test_greedy_decode_cached_runs() -> None:
@@ -420,6 +419,105 @@ def test_hca_no_cache_unchanged() -> None:
     """Default kv_cache=None must be byte-identical to the pre-cache HCA."""
     cfg = ModelConfig.tiny()
     layer = _hca(cfg)
+    h = torch.randn(1, 8, cfg.hidden_dim)
+    with torch.no_grad():
+        a = layer(h)
+        b = layer(h, kv_cache=None)
+    assert torch.equal(a, b)
+
+
+# ---------- CSAKVCacheLayer ----------
+
+
+def _csa(cfg: ModelConfig) -> CSA:
+    torch.manual_seed(0)
+    layer = CSA(cfg.hidden_dim, cfg.attention, cfg.csa)
+    layer.eval()
+    return layer
+
+
+def test_csa_cache_initial_state_empty() -> None:
+    cache = CSAKVCacheLayer(
+        max_seq_len=16, hidden_dim=128, head_dim=32, c_indexer=16, compression_rate=4,
+    )
+    assert cache.length == 0
+    assert cache.n_blocks == 0
+    assert cache.h_buf_count == 0
+
+
+def test_csa_cache_invalid_compression_rate() -> None:
+    with pytest.raises(ValueError, match="compression_rate"):
+        CSAKVCacheLayer(
+            max_seq_len=8, hidden_dim=8, head_dim=4, c_indexer=4, compression_rate=0,
+        )
+
+
+def test_csa_cache_overflow_raises() -> None:
+    cache = CSAKVCacheLayer(
+        max_seq_len=4, hidden_dim=8, head_dim=4, c_indexer=4, compression_rate=2,
+    )
+    h = torch.randn(1, 5, 8)
+    sw_k = torch.randn(1, 5, 4)
+    sw_v = torch.randn(1, 5, 4)
+    with pytest.raises(RuntimeError, match="overflow"):
+        cache.append(
+            h, sw_k, sw_v,
+            compressor=lambda x: x.new_zeros(1, 0, 4),
+            indexer_compressor=lambda x: x.new_zeros(1, 0, 4),
+        )
+
+
+def test_csa_cache_runs_both_compressors_on_block_boundaries() -> None:
+    cache = CSAKVCacheLayer(
+        max_seq_len=8, hidden_dim=8, head_dim=4, c_indexer=2, compression_rate=4,
+    )
+    kv_calls = [0]
+    idx_calls = [0]
+
+    def kv_stub(h: torch.Tensor) -> torch.Tensor:
+        kv_calls[0] += 1
+        return torch.zeros(h.shape[0], h.shape[1] // 4, 4)
+
+    def idx_stub(h: torch.Tensor) -> torch.Tensor:
+        idx_calls[0] += 1
+        return torch.zeros(h.shape[0], h.shape[1] // 4, 2)
+
+    cache.append(
+        torch.randn(1, 4, 8), torch.randn(1, 4, 4), torch.randn(1, 4, 4),
+        compressor=kv_stub, indexer_compressor=idx_stub,
+    )
+    assert kv_calls[0] == 1 and idx_calls[0] == 1
+    assert cache.n_blocks == 1
+
+
+def test_csa_cached_full_pass_matches_uncached() -> None:
+    """CSA token-by-token with cache equals uncached full-pass — within atol
+    that accommodates the documented loss of is_visual bias on the cached
+    path (None is_visual in this test, so the math reduces exactly)."""
+    cfg = ModelConfig.tiny()
+    layer = _csa(cfg)
+    t = 16
+    h = torch.randn(1, t, cfg.hidden_dim)
+    with torch.no_grad():
+        out_full = layer(h)
+
+    cache = CSAKVCacheLayer(
+        max_seq_len=t,
+        hidden_dim=cfg.hidden_dim,
+        head_dim=cfg.attention.head_dim,
+        c_indexer=cfg.csa.indexer_head_dim,
+        compression_rate=cfg.csa.compression_rate,
+    )
+    with torch.no_grad():
+        chunks = [layer(h[:, i:i + 1, :], kv_cache=cache) for i in range(t)]
+    out_cached = torch.cat(chunks, dim=1)
+    assert out_cached.shape == out_full.shape
+    assert torch.allclose(out_cached, out_full, atol=1.0e-3)
+
+
+def test_csa_no_cache_unchanged() -> None:
+    cfg = ModelConfig.tiny()
+    layer = _csa(cfg)
     h = torch.randn(1, 8, cfg.hidden_dim)
     with torch.no_grad():
         a = layer(h)

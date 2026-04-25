@@ -111,7 +111,7 @@ class TransformerBlock(nn.Module):
         # (SWAKVCacheLayer for SWA, HCAKVCacheLayer for HCA, or None). CSA
         # cache support lands in stage 6.
         inner_in, _, b_l, c_l = self.attn_mhc.split(x_expanded)
-        if kv_cache_layer is not None and isinstance(self.attention, SWAttention | HCA):
+        if kv_cache_layer is not None and isinstance(self.attention, SWAttention | HCA | CSA):
             attn_out = self.attention(inner_in, is_visual=is_visual, kv_cache=kv_cache_layer)
         else:
             attn_out = self.attention(inner_in, is_visual=is_visual)

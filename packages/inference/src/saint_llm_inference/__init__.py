@@ -19,11 +19,17 @@ from saint_llm_inference.generate import (
     top_p_sample,
     top_p_sample_cached,
 )
-from saint_llm_inference.kv_cache import HCAKVCacheLayer, KVCacheBundle, SWAKVCacheLayer
+from saint_llm_inference.kv_cache import (
+    CSAKVCacheLayer,
+    HCAKVCacheLayer,
+    KVCacheBundle,
+    SWAKVCacheLayer,
+)
 
 __version__ = "0.0.1"
 
 __all__ = [
+    "CSAKVCacheLayer",
     "HCAKVCacheLayer",
     "KVCacheBundle",
     "SWAKVCacheLayer",

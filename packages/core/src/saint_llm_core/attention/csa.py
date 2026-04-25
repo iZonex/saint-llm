@@ -21,6 +21,8 @@ v0.1 hooks (per AUGMENTATIONS MM-V-06):
 
 from __future__ import annotations
 
+from typing import Any
+
 import torch
 from torch import Tensor, nn
 
@@ -247,76 +249,155 @@ class CSA(nn.Module):
         q = self.q_up(c_q).view(b, t, self.attn_cfg.query_heads, self.attn_cfg.head_dim)
         return q.transpose(1, 2)  # (B, n_heads, T, head_dim)
 
-    def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:
-        b, t, _ = h.shape
-        device = h.device
+    def forward(
+        self,
+        h: Tensor,
+        is_visual: Tensor | None = None,
+        *,
+        kv_cache: Any | None = None,
+    ) -> Tensor:
+        """CSA forward with optional KV cache.
 
+        ``kv_cache`` is duck-typed (``CSAKVCacheLayer``-shaped). Without a
+        cache, behavior matches the pre-cache implementation. With a cache,
+        new tokens go through both compressors via ``cache.append``; the
+        indexer's score+top-k step runs over the full cached block table.
+        """
+        b, t_new, _ = h.shape
+        device = h.device
+        cfg = self.attn_cfg
+        cache_offset = int(kv_cache.length) if kv_cache is not None else 0
+        total_len = cache_offset + t_new
+
+        # Q with RoPE at absolute positions.
         q = self._project_q(h)
-        cos, sin = build_rope_cache(t, self.attn_cfg.rope_dim, self.attn_cfg.rope_theta, device)
-        q = apply_partial_rope(q, cos, sin, self.attn_cfg.rope_dim)
+        cos_full, sin_full = build_rope_cache(total_len, cfg.rope_dim, cfg.rope_theta, device)
+        cos_new = cos_full[cache_offset:total_len]
+        sin_new = sin_full[cache_offset:total_len]
+        q = apply_partial_rope(q, cos_new, sin_new, cfg.rope_dim)
         q = self.q_norm(q)
 
-        # Sparse compressed KV path
-        k_indexer_keys, top_idx = self.indexer(h, is_visual=is_visual)
-        compressed_kv = self.kv_compressor(h)  # (B, n_blocks, head_dim)
-        n_blocks = compressed_kv.shape[1]
-        top_k = top_idx.shape[-1]
+        # SW branch K/V for new tokens.
+        sw_k_new = self.k_proj(h)
+        sw_v_new = self.v_proj(h)
+        sw_k_new = self.k_norm(sw_k_new)
+        sw_k_new = apply_partial_rope(
+            sw_k_new.unsqueeze(1), cos_new, sin_new, cfg.rope_dim,
+        ).squeeze(1)
 
-        valid_pick = top_idx >= 0  # (B, T, top_k) — false where indexer padded a causally-invalid slot
+        m = self.csa_cfg.compression_rate
+        if kv_cache is not None:
+            compressed_kv, k_indexer_comp, sw_k, sw_v = kv_cache.append(
+                h, sw_k_new, sw_v_new,
+                compressor=self.kv_compressor,
+                indexer_compressor=self.indexer.compressor,
+            )
+            n_blocks = compressed_kv.shape[1]
+            sw_total_len = sw_k.shape[1]
+            top_idx = self._indexer_topk_cached(
+                h, k_indexer_comp,
+                cache_offset=cache_offset,
+                total_len=total_len,
+                n_blocks=n_blocks,
+                m=m,
+                is_visual=is_visual,
+            )
+        else:
+            k_indexer_keys, top_idx = self.indexer(h, is_visual=is_visual)
+            compressed_kv = self.kv_compressor(h)
+            n_blocks = compressed_kv.shape[1]
+            sw_k = sw_k_new
+            sw_v = sw_v_new
+            sw_total_len = t_new
+            # Touch indexer keys so the parameter stays live in the loss graph.
+            _ = k_indexer_keys.sum() * 0.0
+            _ = _.detach()
+
+        top_k = top_idx.shape[-1]
+        valid_pick = top_idx >= 0  # (B, t_new, top_k)
         if n_blocks > 0 and top_k > 0:
             top_idx_clamped = top_idx.clamp(min=0)
-            gather_idx = top_idx_clamped.unsqueeze(-1).expand(-1, -1, -1, self.attn_cfg.head_dim)
-            kv_compressed_expanded = compressed_kv.unsqueeze(1).expand(b, t, n_blocks, self.attn_cfg.head_dim)
-            sparse_kv = torch.gather(kv_compressed_expanded, 2, gather_idx)  # (B, T, top_k, head_dim)
+            gather_idx = top_idx_clamped.unsqueeze(-1).expand(-1, -1, -1, cfg.head_dim)
+            kv_compressed_expanded = compressed_kv.unsqueeze(1).expand(b, t_new, n_blocks, cfg.head_dim)
+            sparse_kv = torch.gather(kv_compressed_expanded, 2, gather_idx)
             sparse_kv = self.k_norm(sparse_kv)
         else:
-            sparse_kv = q.new_zeros(b, t, 0, self.attn_cfg.head_dim)
+            sparse_kv = q.new_zeros(b, t_new, 0, cfg.head_dim)
 
-        # Sliding-window uncompressed branch (MQA shared KV)
-        sw = self.attn_cfg.sliding_window_size
-        sw_k = self.k_proj(h)
-        sw_v = self.v_proj(h)
-        sw_k = self.k_norm(sw_k)
-        sw_k = apply_partial_rope(sw_k.unsqueeze(1), cos, sin, self.attn_cfg.rope_dim).squeeze(1)
-
-        sw_mask_full = sliding_window_mask(t, sw, device=device)  # (T, T)
-        causal = causal_mask(t, t, device=device)
-        sw_mask = sw_mask_full & causal
-
-        # Reshape sparse_kv per query: each query has its own top_k compressed KV.
-        # Combine sparse + sliding-window into a single per-query KV tensor:
-        # K_comb shape (B, n_heads, T, top_k + T), gated by sliding mask for the SW portion.
-        # For v0.1 simplicity we attend to (sparse_kv: per-query distinct keys) and (sw_k: shared causal-windowed keys) separately and sum.
-
-        n_heads = self.attn_cfg.query_heads
-        sparse_attn_out = q.new_zeros(b, n_heads, t, self.attn_cfg.head_dim)
+        n_heads = cfg.query_heads
+        sparse_attn_out = q.new_zeros(b, n_heads, t_new, cfg.head_dim)
         if sparse_kv.shape[-2] > 0:
-            # Per-query attention over its own selected compressed KV. top-k is
-            # causal *only when valid_pick is true*; padded picks must be masked.
-            q_for_sparse = q.transpose(1, 2).unsqueeze(-2)  # (B, T, n_heads, 1, head_dim)
-            k_for_sparse = sparse_kv.unsqueeze(2).expand(b, t, n_heads, sparse_kv.shape[-2], self.attn_cfg.head_dim)
-            v_for_sparse = k_for_sparse  # MQA: shared K and V
-            attn_scores = (q_for_sparse * k_for_sparse).sum(-1) / (self.attn_cfg.head_dim ** 0.5)
-            # Mask padded picks; broadcast valid_pick (B, T, top_k) over heads.
+            q_for_sparse = q.transpose(1, 2).unsqueeze(-2)
+            k_for_sparse = sparse_kv.unsqueeze(2).expand(b, t_new, n_heads, sparse_kv.shape[-2], cfg.head_dim)
+            v_for_sparse = k_for_sparse
+            attn_scores = (q_for_sparse * k_for_sparse).sum(-1) / (cfg.head_dim ** 0.5)
             attn_scores = attn_scores.masked_fill(~valid_pick.unsqueeze(2), float("-inf"))
-            # Safe-softmax: a query with zero valid picks has all -inf scores;
-            # softmax would NaN. Replace such rows with zeros pre-softmax, then
-            # zero the row's contribution post-mix.
-            row_has_pick = valid_pick.any(dim=-1, keepdim=True).unsqueeze(2)  # (B, T, 1, 1)
+            row_has_pick = valid_pick.any(dim=-1, keepdim=True).unsqueeze(2)
             attn_scores = torch.where(row_has_pick, attn_scores, torch.zeros_like(attn_scores))
             probs = torch.softmax(attn_scores, dim=-1)
-            mixed = (probs.unsqueeze(-1) * v_for_sparse).sum(-2)  # (B, T, n_heads, head_dim)
+            mixed = (probs.unsqueeze(-1) * v_for_sparse).sum(-2)
             mixed = torch.where(row_has_pick, mixed, torch.zeros_like(mixed))
             sparse_attn_out = mixed.transpose(1, 2)
 
-        sw_k_h = sw_k.unsqueeze(1).expand(b, n_heads, t, self.attn_cfg.head_dim)
-        sw_v_h = sw_v.unsqueeze(1).expand(b, n_heads, t, self.attn_cfg.head_dim)
+        # SW branch attention.
+        if cache_offset == 0:
+            sw_mask = (
+                sliding_window_mask(sw_total_len, cfg.sliding_window_size, device=device)
+                & causal_mask(sw_total_len, sw_total_len, device=device)
+            )
+        else:
+            q_pos = torch.arange(cache_offset, total_len, device=device).unsqueeze(-1)
+            k_pos = torch.arange(sw_total_len, device=device).unsqueeze(0)
+            sw_mask = (k_pos <= q_pos) & ((q_pos - k_pos) < cfg.sliding_window_size)
+        sw_k_h = sw_k.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
+        sw_v_h = sw_v.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
         sw_attn_out = scaled_dot_product(q, sw_k_h, sw_v_h, mask=sw_mask, sink_logit=self.sink_logit)
 
-        attn_out = sparse_attn_out + sw_attn_out
+        return self.output(sparse_attn_out + sw_attn_out)
 
-        # Touch indexer keys so the parameters stay live; no-op for shape.
-        _ = k_indexer_keys.sum() * 0.0
-        _ = _.detach()
+    def _indexer_topk_cached(
+        self,
+        h: Tensor,
+        k_indexer_comp: Tensor,
+        *,
+        cache_offset: int,
+        total_len: int,
+        n_blocks: int,
+        m: int,
+        is_visual: Tensor | None,
+    ) -> Tensor:
+        """Run the indexer's score+top-k against a pre-cached compressed K table.
 
-        return self.output(attn_out)
+        Mirrors ``LightningIndexer.forward`` but skips the compressor (cache
+        provides ``k_indexer_comp``) and uses absolute query positions for
+        the causal mask.
+
+        ``is_visual`` is intentionally ignored on the cached path — the
+        per-step mask shape ``(B, t_new)`` is misaligned with the cached
+        block table ``(B, n_blocks, m)``. Visual cohesion bias only applies
+        at prefill (uncached) time. Documented limitation; revisit if a
+        caller needs it.
+        """
+        del is_visual
+        b, t_new, _ = h.shape
+        idx = self.indexer
+        device = h.device
+
+        c_q = idx.w_dq(h)
+        q_indexer = idx.w_iuq(c_q).view(b, t_new, idx.n_heads, idx.c_indexer)
+        w = idx.w_w(h)
+        head_scores = torch.einsum("bthc,bnc->bthn", q_indexer, k_indexer_comp).clamp(min=0.0)
+        scores = (w.unsqueeze(-1) * head_scores).sum(dim=-2)  # (B, t_new, n_blocks)
+
+        if n_blocks > 0:
+            q_pos = torch.arange(cache_offset, total_len, device=device).unsqueeze(-1)
+            block_end = torch.arange(n_blocks, device=device).unsqueeze(0) * m + (m - 1)
+            valid_block = block_end < q_pos
+            scores = scores.masked_fill(~valid_block, float("-inf"))
+
+        k_eff = min(idx.top_k, n_blocks)
+        if k_eff == 0:
+            return h.new_full((b, t_new, 0), -1, dtype=torch.long)
+        top_scores, top_idx = scores.topk(k_eff, dim=-1)
+        valid_init = torch.isfinite(top_scores)
+        return torch.where(valid_init, top_idx, top_idx.new_full((), -1))

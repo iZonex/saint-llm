@@ -207,16 +207,136 @@ class HCAKVCacheLayer:
         self.h_buf_count = 0
 
 
-_CacheLayer = SWAKVCacheLayer | HCAKVCacheLayer | None
+class CSAKVCacheLayer:
+    """Append-only KV cache for ``CSA``.
+
+    Four buffers per layer (one block index, two compressed caches that
+    advance in lockstep on m-aligned boundaries, plus the SW branch K/V):
+
+    * ``compressed_kv`` (B, max_blocks, head_dim) — output of CSA.kv_compressor.
+    * ``indexer_kv`` (B, max_blocks, c_indexer) — output of CSA.indexer.compressor.
+    * ``h_buffer`` (B, m, hidden_dim) — raw hidden states for the in-progress
+      block, shared across the two compressors (same compression_rate).
+    * ``sw_k`` / ``sw_v`` (B, max_seq_len, head_dim) — sliding-window branch
+      K/V (RoPE'd, k-normed externally before append).
+
+    Module-decoupled: ``append`` accepts ``compressor`` and
+    ``indexer_compressor`` callables (typically ``csa.kv_compressor`` and
+    ``csa.indexer.compressor``).
+    """
+
+    def __init__(
+        self,
+        max_seq_len: int,
+        hidden_dim: int,
+        head_dim: int,
+        c_indexer: int,
+        compression_rate: int,
+        *,
+        batch_size: int = 1,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype = torch.float32,
+    ) -> None:
+        if max_seq_len <= 0:
+            raise ValueError(f"max_seq_len must be positive; got {max_seq_len}")
+        if compression_rate <= 0:
+            raise ValueError(f"compression_rate must be positive; got {compression_rate}")
+        self.max_seq_len = max_seq_len
+        self.hidden_dim = hidden_dim
+        self.head_dim = head_dim
+        self.c_indexer = c_indexer
+        self.compression_rate = compression_rate
+        self.batch_size = batch_size
+        max_blocks = max_seq_len // compression_rate
+        self.compressed_kv = torch.zeros(
+            batch_size, max_blocks, head_dim, device=device, dtype=dtype,
+        )
+        self.indexer_kv = torch.zeros(
+            batch_size, max_blocks, c_indexer, device=device, dtype=dtype,
+        )
+        self.h_buffer = torch.zeros(
+            batch_size, compression_rate, hidden_dim, device=device, dtype=dtype,
+        )
+        self.h_buf_count = 0
+        self.n_blocks = 0
+        self.sw_k = torch.zeros(batch_size, max_seq_len, head_dim, device=device, dtype=dtype)
+        self.sw_v = torch.zeros(batch_size, max_seq_len, head_dim, device=device, dtype=dtype)
+        self.length = 0
+
+    def append(
+        self,
+        h_new: Tensor,
+        sw_k_new: Tensor,
+        sw_v_new: Tensor,
+        *,
+        compressor: Callable[[Tensor], Tensor],
+        indexer_compressor: Callable[[Tensor], Tensor],
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Append T_new tokens. Returns (compressed_kv, indexer_kv, sw_k, sw_v) views."""
+        if h_new.dim() != 3 or sw_k_new.dim() != 3 or sw_v_new.dim() != 3:
+            raise ValueError(
+                "h_new, sw_k_new, sw_v_new must all be 3D (B, T, *); got "
+                f"{tuple(h_new.shape)}, {tuple(sw_k_new.shape)}, {tuple(sw_v_new.shape)}",
+            )
+        n = sw_k_new.shape[1]
+        if self.length + n > self.max_seq_len:
+            raise RuntimeError(
+                f"CSAKVCacheLayer overflow: tried to append {n} tokens at "
+                f"length {self.length} into max_seq_len={self.max_seq_len}",
+            )
+
+        self.sw_k[:, self.length:self.length + n] = sw_k_new
+        self.sw_v[:, self.length:self.length + n] = sw_v_new
+
+        if self.h_buf_count > 0:
+            combined = torch.cat([self.h_buffer[:, :self.h_buf_count], h_new], dim=1)
+        else:
+            combined = h_new
+        total = self.h_buf_count + n
+        n_complete = total // self.compression_rate
+        n_consumed = n_complete * self.compression_rate
+
+        if n_complete > 0:
+            tail = combined[:, :n_consumed]
+            new_kv = compressor(tail)
+            new_idx = indexer_compressor(tail)
+            if new_kv.shape[1] != n_complete or new_idx.shape[1] != n_complete:
+                raise RuntimeError(
+                    f"compressor returned {new_kv.shape[1]} / "
+                    f"{new_idx.shape[1]} blocks, expected {n_complete}",
+                )
+            self.compressed_kv[:, self.n_blocks:self.n_blocks + n_complete] = new_kv
+            self.indexer_kv[:, self.n_blocks:self.n_blocks + n_complete] = new_idx
+            self.n_blocks += n_complete
+
+        leftover = total - n_consumed
+        if leftover > 0:
+            self.h_buffer[:, :leftover] = combined[:, n_consumed:]
+        self.h_buf_count = leftover
+        self.length += n
+        return (
+            self.compressed_kv[:, :self.n_blocks],
+            self.indexer_kv[:, :self.n_blocks],
+            self.sw_k[:, :self.length],
+            self.sw_v[:, :self.length],
+        )
+
+    def reset(self) -> None:
+        self.length = 0
+        self.n_blocks = 0
+        self.h_buf_count = 0
+
+
+_CacheLayer = SWAKVCacheLayer | HCAKVCacheLayer | CSAKVCacheLayer | None
 
 
 class KVCacheBundle:
     """Per-layer KV cache container indexed by transformer block index.
 
-    Entries are typed ``SWAKVCacheLayer | HCAKVCacheLayer | None``. ``None``
-    means "this block has no cache; fall back to recompute". The ``length``
-    property returns the global decoded length from any populated entry —
-    all entries advance in lockstep.
+    Entries are typed ``SWAKVCacheLayer | HCAKVCacheLayer | CSAKVCacheLayer
+    | None``. ``None`` means "this block has no cache; fall back to
+    recompute". The ``length`` property returns the global decoded length
+    from any populated entry — all entries advance in lockstep.
     """
 
     def __init__(self, layers: list[_CacheLayer]) -> None:
@@ -261,11 +381,12 @@ class KVCacheBundle:
         SWAttention → ``SWAKVCacheLayer``.
         HCA → ``HCAKVCacheLayer`` (uses ``cfg.hca.compression_rate`` and
         ``cfg.hidden_dim`` for the h-buffer).
-        CSA → ``None`` (stage 6 — pending).
+        CSA → ``CSAKVCacheLayer`` (uses ``cfg.csa.compression_rate`` +
+        ``cfg.csa.indexer_head_dim`` for the indexer cache).
         """
         # Local imports to keep the runtime graph free of saint_llm_core when
         # this helper isn't used. Avoids a hard dep cycle in tests.
-        from saint_llm_core.attention import HCA, SWAttention  # noqa: PLC0415
+        from saint_llm_core.attention import CSA, HCA, SWAttention  # noqa: PLC0415
 
         cfg = model.cfg  # type: ignore[attr-defined]
         head_dim = cfg.attention.head_dim
@@ -286,6 +407,17 @@ class KVCacheBundle:
                     hidden_dim=hidden_dim,
                     head_dim=head_dim,
                     compression_rate=cfg.hca.compression_rate,
+                    batch_size=batch_size,
+                    device=device,
+                    dtype=dtype,
+                ))
+            elif isinstance(block.attention, CSA):
+                layers.append(CSAKVCacheLayer(
+                    max_seq_len=max_seq_len,
+                    hidden_dim=hidden_dim,
+                    head_dim=head_dim,
+                    c_indexer=cfg.csa.indexer_head_dim,
+                    compression_rate=cfg.csa.compression_rate,
                     batch_size=batch_size,
                     device=device,
                     dtype=dtype,
