@@ -45,7 +45,7 @@ class VisionEncoderConfig(BaseModel):
         return self.encoder_hidden_dim
 
 
-def deepstack_fuse(hidden_states: "Sequence[Tensor]", layers: tuple[int, ...]) -> Tensor:
+def deepstack_fuse(hidden_states: Sequence[Tensor], layers: tuple[int, ...]) -> Tensor:
     """Concatenate per-patch features from selected ViT layers along the hidden dim.
 
     hidden_states: list of (B, n_patches, encoder_dim) — one per ViT layer (incl embeddings).

@@ -119,6 +119,13 @@ class ModelConfig(BaseModel):
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
 
+    # Linear-layer quantization for QAT-style training.
+    # bf16: standard nn.Linear (no quant). fp8: E4M3 with STE (Fp8Linear).
+    # fp4:  MXFP4 E2M1 block-32 with STE (Fp4Linear). Applied to MoE expert
+    # SwiGLU projections; other Linears (router, lm_head, attention) stay bf16.
+    linear_quant: Literal["bf16", "fp8", "fp4"] = "bf16"
+    fp4_block_size: int = 32
+
     @classmethod
     def v4_flash(cls) -> ModelConfig:
         return cls()

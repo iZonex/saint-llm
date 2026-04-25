@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-
 from saint_llm_core.attention import CSA, HCA, SWAttention
 from saint_llm_core.attention.common import causal_mask, sliding_window_mask
 from saint_llm_core.config import ModelConfig

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-
 from saint_llm_core.config import ModelConfig
 from saint_llm_core.moe import DeepSeekMoE, HashRouter
 from saint_llm_core.mtp import MTPStack

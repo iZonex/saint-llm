@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import pytest
 import torch
-
 from saint_llm_core.config import MHCConfig, ModelConfig
 from saint_llm_core.residual.mhc import MHC, sinkhorn_knopp
 

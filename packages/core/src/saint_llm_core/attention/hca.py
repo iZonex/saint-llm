@@ -52,7 +52,7 @@ class HCA(nn.Module):
             hidden_dim, attn.query_heads, attn.head_dim, attn.output_proj_groups, attn.attention_intermediate_dim,
         )
 
-    def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:  # noqa: ARG002
+    def forward(self, h: Tensor, is_visual: Tensor | None = None) -> Tensor:
         b, t, _ = h.shape
         device = h.device
 

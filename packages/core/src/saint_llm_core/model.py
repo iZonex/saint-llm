@@ -30,19 +30,25 @@ Each transformer block:
 
 from __future__ import annotations
 
-import torch
 from torch import Tensor, nn
 
 from saint_llm_core.attention import CSA, HCA, RMSNorm, SWAttention
 from saint_llm_core.config import ModelConfig
-from saint_llm_core.moe import DeepSeekMoE
+from saint_llm_core.moe import DeepSeekMoE, LinearFactory
 from saint_llm_core.mtp import MTPStack
 from saint_llm_core.multimodal import GenerationHeadHook, ModalityProjector, ResidualSideChannel
+from saint_llm_core.quant import make_linear_factory
 from saint_llm_core.residual import MHC
 
 
 class TransformerBlock(nn.Module):
-    def __init__(self, cfg: ModelConfig, layer_idx: int) -> None:
+    def __init__(
+        self,
+        cfg: ModelConfig,
+        layer_idx: int,
+        *,
+        linear_factory: LinearFactory,
+    ) -> None:
         super().__init__()
         self.layer_idx = layer_idx
 
@@ -62,6 +68,7 @@ class TransformerBlock(nn.Module):
         self.moe = DeepSeekMoE(
             cfg.hidden_dim, cfg.moe, layer_idx=layer_idx,
             enable_modality_router_bias=cfg.multimodal.enable_modality_router_bias,
+            linear_factory=linear_factory,
         )
         self.side_channel = ResidualSideChannel(cfg.hidden_dim, cfg.multimodal.side_channel_alpha_init)
 
@@ -104,7 +111,10 @@ class SaintLLM(nn.Module):
             cfg.multimodal.audio_input_dim, cfg.hidden_dim, enabled=cfg.multimodal.enable_audio_projector,
         )
 
-        self.blocks = nn.ModuleList(TransformerBlock(cfg, i) for i in range(cfg.n_layers))
+        linear_factory = make_linear_factory(cfg.linear_quant, fp4_block_size=cfg.fp4_block_size)
+        self.blocks = nn.ModuleList(
+            TransformerBlock(cfg, i, linear_factory=linear_factory) for i in range(cfg.n_layers)
+        )
         self.final_norm = RMSNorm(cfg.hidden_dim, eps=cfg.rms_norm_eps)
         self.lm_head = nn.Linear(cfg.hidden_dim, cfg.vocab_size, bias=False)
         if cfg.tie_word_embeddings:

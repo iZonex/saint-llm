@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import torch
-
 from saint_llm_core import ModelConfig, SaintLLM
 from saint_llm_core.multimodal import GenerationHeadHook, ResidualSideChannel
 

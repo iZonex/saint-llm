@@ -8,7 +8,11 @@ dependencies = [
     "torch>=2.5",
     "einops>=0.8",
     "pydantic>=2.9",
+    "saint-llm-kernels",
 ]
+
+[tool.uv.sources]
+saint-llm-kernels = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

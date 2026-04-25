@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import pytest
 import torch
-
 from saint_llm_core import ModelConfig, SaintLLM
 from saint_llm_core.config import MultimodalConfig
 from saint_llm_core.multimodal import (

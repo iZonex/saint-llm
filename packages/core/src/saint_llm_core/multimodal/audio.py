@@ -21,7 +21,6 @@ Fits comfortably in V4's 1M context window.
 
 from __future__ import annotations
 
-import torch
 import torch.nn.functional as F
 from pydantic import BaseModel, ConfigDict
 from torch import Tensor, nn
