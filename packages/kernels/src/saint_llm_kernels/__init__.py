@@ -10,8 +10,11 @@ Modules:
 
 from saint_llm_kernels.quant import (
     Fp8Format,
+    cast_to_fp4_mx,
     cast_to_fp8,
+    dequant_from_fp4_mx,
     dequant_from_fp8,
+    fake_quant_fp4_mx,
     fake_quant_fp8,
 )
 
@@ -19,7 +22,10 @@ __version__ = "0.0.1"
 
 __all__ = [
     "Fp8Format",
+    "cast_to_fp4_mx",
     "cast_to_fp8",
+    "dequant_from_fp4_mx",
     "dequant_from_fp8",
+    "fake_quant_fp4_mx",
     "fake_quant_fp8",
 ]
