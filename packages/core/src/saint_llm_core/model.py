@@ -264,9 +264,19 @@ class SaintLLM(nn.Module):
         mtp_logits = [self.lm_head(mh) for mh in mtp_hidden]
         gen_logits = self.generation_head(h)
 
+        # Sum each MoE block's _last_aux_loss (set in DeepSeekMoE.forward when
+        # the learned router fires). Hash-routed layers contribute zero.
+        aux_loss: Tensor | None = None
+        for block in self.blocks:
+            block_aux = getattr(block.moe, "_last_aux_loss", None)
+            if block_aux is None or not isinstance(block_aux, Tensor):
+                continue
+            aux_loss = block_aux if aux_loss is None else aux_loss + block_aux
+
         return {
             "logits": logits,
             "mtp_logits": mtp_logits,
             "generation_logits": gen_logits,
             "hidden": h,
+            "aux_loss": aux_loss,
         }

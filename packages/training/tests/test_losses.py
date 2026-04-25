@@ -106,3 +106,44 @@ def test_cross_entropy_with_mtp_rejects_non_list_mtp() -> None:
     batch = torch.zeros(1, 4, dtype=torch.long)
     with pytest.raises(TypeError, match="list of Tensors"):
         cross_entropy_with_mtp(bad_out, batch, cfg=cfg)
+
+
+def test_saintllm_forward_returns_aux_loss(model: SaintLLM) -> None:
+    """Output dict carries ``aux_loss`` summed across learned-router blocks."""
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    with torch.no_grad():
+        out = model(batch)
+    assert "aux_loss" in out
+    aux = out["aux_loss"]
+    # tiny config has hash_routed_layers=1; remaining 3 layers use learned router.
+    assert isinstance(aux, torch.Tensor)
+    assert torch.isfinite(aux).item()
+
+
+def test_make_loss_fn_with_moe_cfg_adds_aux_term(model: SaintLLM) -> None:
+    """Total = main + balance_weight * aux_loss when moe_cfg is supplied."""
+    cfg = ModelConfig.tiny()
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    loss_no_aux = make_loss_fn(None)(model, batch)
+    loss_with_aux = make_loss_fn(None, moe_cfg=cfg.moe)(model, batch)
+    # Expect a small but non-zero gap given default sequence_balance_weight=1e-4.
+    assert loss_with_aux.item() != loss_no_aux.item()
+
+
+def test_cross_entropy_with_mtp_includes_aux_when_moe_cfg(model: SaintLLM) -> None:
+    cfg = ModelConfig.tiny()
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    with torch.no_grad():
+        out = model(batch)
+    no_aux = cross_entropy_with_mtp(out, batch, cfg=cfg.mtp)
+    with_aux = cross_entropy_with_mtp(out, batch, cfg=cfg.mtp, moe_cfg=cfg.moe)
+    assert with_aux.item() != no_aux.item()
+
+
+def test_aux_loss_zero_balance_weight_short_circuits(model: SaintLLM) -> None:
+    cfg = ModelConfig.tiny()
+    moe_zero = cfg.moe.model_copy(update={"sequence_balance_weight": 0.0})
+    batch = torch.zeros(1, 16, dtype=torch.long)
+    a = make_loss_fn(None)(model, batch)
+    b = make_loss_fn(None, moe_cfg=moe_zero)(model, batch)
+    assert torch.allclose(a, b, atol=1.0e-7)
