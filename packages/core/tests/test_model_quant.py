@@ -146,6 +146,39 @@ def test_fp8_use_real_gemm_default_false() -> None:
     assert first_expert.gate_proj.use_real_fp8_gemm is False
 
 
+def test_default_moe_does_not_use_grouped_gemm() -> None:
+    cfg = _tiny()
+    model = SaintLLM(cfg)
+    for block in model.blocks:
+        assert block.moe.grouped_experts is None
+        assert len(block.moe.routed_experts) == cfg.moe.routed_experts
+
+
+def test_moe_use_grouped_gemm_flag_swaps_expert_pool() -> None:
+    from saint_llm_kernels import GroupedSwiGLUExperts
+
+    cfg = _tiny().model_copy(update={"moe_use_grouped_gemm": True})
+    model = SaintLLM(cfg)
+    for block in model.blocks:
+        if block.moe.use_hash_routing or block.moe.router is not None:
+            # Hash-routed and learned-routed layers both use grouped path now.
+            assert isinstance(block.moe.grouped_experts, GroupedSwiGLUExperts)
+            assert len(block.moe.routed_experts) == 0
+
+
+def test_grouped_moe_forward_finite() -> None:
+    """End-to-end: SaintLLM with moe_use_grouped_gemm=True forwards finite logits."""
+    cfg = _tiny().model_copy(update={"moe_use_grouped_gemm": True})
+    model = SaintLLM(cfg)
+    model.eval()
+    token_ids = torch.zeros(1, 16, dtype=torch.long)
+    with torch.no_grad():
+        out = model(token_ids)
+    logits = out["logits"]
+    assert isinstance(logits, torch.Tensor)
+    assert torch.isfinite(logits).all()
+
+
 def test_fp8_use_real_gemm_propagates_to_layers() -> None:
     cfg = _tiny().model_copy(update={"linear_quant": "fp8", "fp8_use_real_gemm": True})
     model = SaintLLM(cfg)

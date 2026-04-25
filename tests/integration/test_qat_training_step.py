@@ -55,6 +55,23 @@ def test_loss_decreases_over_a_few_steps(mode: str) -> None:
     assert losses[-1] < losses[0], f"loss did not decrease in {mode}: {losses}"
 
 
+def test_loss_decreases_with_grouped_moe() -> None:
+    """SaintLLM with moe_use_grouped_gemm=True trains end-to-end on the
+    memorize-16-tokens task. Catches scatter-add / sort plumbing bugs that
+    would only show up under gradient + optimizer interaction."""
+    torch.manual_seed(0)
+    cfg = ModelConfig.tiny().model_copy(update={"moe_use_grouped_gemm": True})
+    model = SaintLLM(cfg)
+    model.train()
+
+    optim = torch.optim.AdamW(model.parameters(), lr=3.0e-3)
+    token_ids = _fixed_token_batch(cfg)
+
+    losses = [_train_step_loss(model, token_ids, optim) for _ in range(4)]
+    assert all(torch.isfinite(torch.tensor(loss)) for loss in losses), losses
+    assert losses[-1] < losses[0], f"loss did not decrease with grouped MoE: {losses}"
+
+
 @pytest.mark.gpu
 def test_loss_decreases_with_real_fp8_gemm() -> None:
     """End-to-end: SaintLLM trains under fp8 + use_real_fp8_gemm on Ada+."""

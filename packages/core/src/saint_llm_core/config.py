@@ -127,6 +127,11 @@ class ModelConfig(BaseModel):
     # When linear_quant=="fp8" and we're on Ada sm89+, swap fake-quant + F.linear
     # for a real torch._scaled_mm call. Falls back transparently on CPU / older GPUs.
     fp8_use_real_gemm: bool = False
+    # When True, MoE routed_experts go through saint_llm_kernels.GroupedSwiGLUExperts
+    # (one sort + 3 torch._grouped_mm calls) instead of the per-expert Python loop.
+    # Limitation: grouped path is bf16/fp32 only — no fp8/fp4 quant on routed experts
+    # in this mode. shared_experts still respect linear_quant.
+    moe_use_grouped_gemm: bool = False
 
     @classmethod
     def v4_flash(cls) -> ModelConfig:

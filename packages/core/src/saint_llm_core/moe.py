@@ -126,11 +126,13 @@ class DeepSeekMoE(nn.Module):
         enable_modality_router_bias: bool = True,
         *,
         linear_factory: LinearFactory = _default_linear,
+        use_grouped_gemm: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.cfg = cfg
         self.layer_idx = layer_idx
+        self.use_grouped_gemm = use_grouped_gemm
 
         self.use_hash_routing = layer_idx < cfg.hash_routed_layers
 
@@ -143,14 +145,31 @@ class DeepSeekMoE(nn.Module):
             )
             for _ in range(cfg.shared_experts)
         )
-        self.routed_experts = nn.ModuleList(
-            SwiGLU(
-                hidden_dim, cfg.expert_intermediate_dim,
-                cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max,
-                linear_factory=linear_factory,
+        # Routed experts: per-expert SwiGLU loop (default) or stacked-weight
+        # grouped-GEMM pool. Grouped path ignores linear_factory and stays in
+        # full precision; fp8/fp4 grouped GEMM is reserved for a follow-up.
+        self.grouped_experts: nn.Module | None
+        if use_grouped_gemm:
+            from saint_llm_kernels import GroupedSwiGLUExperts
+
+            self.grouped_experts = GroupedSwiGLUExperts(
+                hidden_dim=hidden_dim,
+                intermediate_dim=cfg.expert_intermediate_dim,
+                n_experts=cfg.routed_experts,
+                clamp_linear=cfg.swiglu_clamp_linear,
+                clamp_gate_max=cfg.swiglu_clamp_gate_max,
             )
-            for _ in range(cfg.routed_experts)
-        )
+            self.routed_experts = nn.ModuleList()
+        else:
+            self.grouped_experts = None
+            self.routed_experts = nn.ModuleList(
+                SwiGLU(
+                    hidden_dim, cfg.expert_intermediate_dim,
+                    cfg.swiglu_clamp_linear, cfg.swiglu_clamp_gate_max,
+                    linear_factory=linear_factory,
+                )
+                for _ in range(cfg.routed_experts)
+            )
 
         if not self.use_hash_routing:
             self.router = LearnedRouter(
@@ -181,20 +200,24 @@ class DeepSeekMoE(nn.Module):
             expert_idx, gate, affinity = self.router(h, is_visual=is_visual)
             self._last_aux_loss = self._sequence_balance_loss(affinity, expert_idx)
 
-        routed_out = torch.zeros_like(h)
         flat_h = h.reshape(b * t, d)
         flat_gate = gate.reshape(b * t, self.cfg.experts_per_token)
         flat_idx = expert_idx.reshape(b * t, self.cfg.experts_per_token)
 
-        for e_id in range(self.cfg.routed_experts):
-            mask = (flat_idx == e_id)
-            if not mask.any():
-                continue
-            token_pos, slot_pos = mask.nonzero(as_tuple=True)
-            tokens = flat_h[token_pos]
-            weights = flat_gate[token_pos, slot_pos].unsqueeze(-1)
-            expert_out = self.routed_experts[e_id](tokens) * weights
-            routed_out.view(b * t, d).index_add_(0, token_pos, expert_out)
+        if self.grouped_experts is not None:
+            routed_flat = self.grouped_experts(flat_h, flat_idx, flat_gate)
+            routed_out = routed_flat.reshape(b, t, d)
+        else:
+            routed_out = torch.zeros_like(h)
+            for e_id in range(self.cfg.routed_experts):
+                mask = (flat_idx == e_id)
+                if not mask.any():
+                    continue
+                token_pos, slot_pos = mask.nonzero(as_tuple=True)
+                tokens = flat_h[token_pos]
+                weights = flat_gate[token_pos, slot_pos].unsqueeze(-1)
+                expert_out = self.routed_experts[e_id](tokens) * weights
+                routed_out.view(b * t, d).index_add_(0, token_pos, expert_out)
 
         shared_out = sum((expert(h) for expert in self.shared_experts), start=torch.zeros_like(h))
         return shared_out + routed_out

@@ -69,6 +69,7 @@ class TransformerBlock(nn.Module):
             cfg.hidden_dim, cfg.moe, layer_idx=layer_idx,
             enable_modality_router_bias=cfg.multimodal.enable_modality_router_bias,
             linear_factory=linear_factory,
+            use_grouped_gemm=cfg.moe_use_grouped_gemm,
         )
         self.side_channel = ResidualSideChannel(cfg.hidden_dim, cfg.multimodal.side_channel_alpha_init)
 
