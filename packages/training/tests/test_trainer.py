@@ -186,3 +186,49 @@ def test_no_grad_clip_by_default() -> None:
     opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
     trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
     assert trainer.grad_clip_norm is None
+
+
+def test_evaluate_returns_mean_loss(trainer: Trainer) -> None:
+    cfg = ModelConfig.tiny()
+    batches = [torch.randint(0, cfg.vocab_size, (1, 16)) for _ in range(3)]
+    mean = trainer.evaluate(iter(batches))
+    assert isinstance(mean, float)
+    assert torch.isfinite(torch.tensor(mean))
+
+
+def test_evaluate_does_not_update_weights() -> None:
+    cfg = ModelConfig.tiny()
+    torch.manual_seed(0)
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+
+    snap = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    trainer.evaluate(iter([torch.randint(0, cfg.vocab_size, (1, 16))]))
+    for k, v in model.state_dict().items():
+        assert torch.equal(v, snap[k]), f"evaluate() mutated {k}"
+
+
+def test_evaluate_restores_train_mode_when_called_from_training() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+    model.train()
+    trainer.evaluate(iter([torch.randint(0, cfg.vocab_size, (1, 16))]))
+    assert model.training is True
+
+
+def test_evaluate_leaves_eval_mode_when_called_from_eval() -> None:
+    cfg = ModelConfig.tiny()
+    model = SaintLLM(cfg)
+    opt = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    trainer = Trainer(model, opt, loss_fn=_ce_loss_fn)
+    model.eval()
+    trainer.evaluate(iter([torch.randint(0, cfg.vocab_size, (1, 16))]))
+    assert model.training is False
+
+
+def test_evaluate_empty_iterator_raises(trainer: Trainer) -> None:
+    with pytest.raises(ValueError, match="empty iterator"):
+        trainer.evaluate(iter([]))

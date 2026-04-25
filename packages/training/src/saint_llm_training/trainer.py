@@ -14,7 +14,7 @@ HuggingFace-Trainer-style godclass.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -85,6 +85,31 @@ class Trainer:
             self.lr_scheduler.step()
         self.step += 1
         return float(loss.detach().item())
+
+    @torch.no_grad()
+    def evaluate(self, eval_iter: Iterable[Tensor]) -> float:
+        """Run ``loss_fn`` under ``torch.no_grad`` over an iterable of batches.
+
+        Returns the unweighted mean of per-batch loss values. Toggles the model
+        into eval mode for the duration; the caller's prior train/eval state is
+        restored on exit.
+        """
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            total = 0.0
+            count = 0
+            for raw_batch in eval_iter:
+                batch = raw_batch.to(self.device)
+                loss = self.loss_fn(self.model, batch)
+                total += float(loss.detach().item())
+                count += 1
+            if count == 0:
+                raise ValueError("evaluate() received an empty iterator")
+            return total / count
+        finally:
+            if was_training:
+                self.model.train()
 
     def save(self, path: str | Path, *, extra: dict[str, Any] | None = None) -> None:
         """Persist model + optimizer + step + LR-scheduler state to ``path``."""
