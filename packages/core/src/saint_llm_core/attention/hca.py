@@ -66,6 +66,13 @@ class HCA(nn.Module):
             linear_factory=linear_factory,
         )
 
+        # MuonClip QK-Clip telemetry — see SWAttention for the rationale.
+        self._last_max_attn_logit: float = 0.0
+
+    def qk_clip_targets(self) -> list[Tensor]:
+        """Q/K projection weights to rescale on QK-Clip trigger."""
+        return [self.q_up.weight, self.k_proj.weight]
+
     def forward(
         self,
         h: Tensor,
@@ -147,6 +154,16 @@ class HCA(nn.Module):
 
         sw_k_h = sw_k.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
         sw_v_h = sw_v.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
-        sw_attn_out = scaled_dot_product(q, sw_k_h, sw_v_h, mask=sw_mask, sink_logit=self.sink_logit)
+
+        def _observe(scores: Tensor) -> None:
+            # MuonClip telemetry — track max logit on the SW path; same
+            # projection weights as the sparse path, so this is sufficient.
+            self._last_max_attn_logit = float(scores.detach().abs().max())
+
+        sw_attn_out = scaled_dot_product(
+            q, sw_k_h, sw_v_h, mask=sw_mask, sink_logit=self.sink_logit,
+            score_observer=_observe,
+            logit_softcap=self.attn_cfg.logit_softcap,
+        )
 
         return self.output(compressed_attn_out + sw_attn_out)

@@ -52,6 +52,23 @@ class SWAttention(nn.Module):
             linear_factory=linear_factory,
         )
 
+        # MuonClip QK-Clip telemetry (ADR-0010 / OPT-01). Updated on every
+        # forward via the ``scaled_dot_product`` ``score_observer`` hook;
+        # the Muon optimizer reads it after each step and rescales
+        # ``q_up.weight`` / ``k_proj.weight`` when it exceeds the configured
+        # threshold tau.
+        self._last_max_attn_logit: float = 0.0
+
+    def qk_clip_targets(self) -> list[Tensor]:
+        """Q and K projection weight matrices to rescale on QK-Clip trigger.
+
+        SWA's effective W_q is ``q_up @ q_compressor``; rescaling only
+        ``q_up`` (the per-head expansion stage) gives the same effective-
+        weight scale change as rescaling both stages by sqrt(scale)*sqrt(scale).
+        K side is the single ``k_proj`` matrix.
+        """
+        return [self.q_up.weight, self.k_proj.weight]
+
     def forward(
         self,
         h: Tensor,
@@ -110,5 +127,12 @@ class SWAttention(nn.Module):
         k_h = k.unsqueeze(1).expand(b, cfg.query_heads, t_keys, cfg.head_dim)
         v_h = v.unsqueeze(1).expand(b, cfg.query_heads, t_keys, cfg.head_dim)
 
-        attn_out = scaled_dot_product(q, k_h, v_h, mask=mask, sink_logit=self.sink_logit)
+        def _observe(scores: Tensor) -> None:
+            self._last_max_attn_logit = float(scores.detach().abs().max())
+
+        attn_out = scaled_dot_product(
+            q, k_h, v_h, mask=mask, sink_logit=self.sink_logit,
+            score_observer=_observe,
+            logit_softcap=self.attn_cfg.logit_softcap,
+        )
         return self.output(attn_out)

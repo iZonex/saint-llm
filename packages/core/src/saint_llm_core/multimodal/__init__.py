@@ -11,6 +11,11 @@ from saint_llm_core.multimodal.hooks import (
     ModalityProjector,
     ResidualSideChannel,
 )
+from saint_llm_core.multimodal.video import (
+    FakeVideoTokenizer,
+    VideoTokenizer,
+    encode_video_clips,
+)
 from saint_llm_core.multimodal.vision import (
     FakeViT,
     SigLIP2Wrapper,
@@ -23,13 +28,16 @@ __all__ = [
     "AudioEncoderConfig",
     "AudioTokenizer",
     "FakeViT",
+    "FakeVideoTokenizer",
     "FakeWhisperEncoder",
     "GenerationHeadHook",
     "ModalityProjector",
     "ResidualSideChannel",
     "SigLIP2Wrapper",
+    "VideoTokenizer",
     "VisionEncoderConfig",
     "VisionTokenizer",
     "WhisperLargeV3Wrapper",
     "deepstack_fuse",
+    "encode_video_clips",
 ]

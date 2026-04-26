@@ -8,10 +8,14 @@ dependencies = [
     "pydantic>=2.9",
     "torch>=2.5",
     "saint-llm-core",
+    "saint-llm-inference",
+    "saint-llm-data",
 ]
 
 [tool.uv.sources]
 saint-llm-core = { workspace = true }
+saint-llm-inference = { workspace = true }
+saint-llm-data = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

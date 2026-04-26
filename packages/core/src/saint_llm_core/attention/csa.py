@@ -243,6 +243,15 @@ class CSA(nn.Module):
             linear_factory=linear_factory,
         )
 
+        # MuonClip QK-Clip telemetry — see SWAttention for the rationale.
+        # Tracked from the SW path inside CSA's forward; sparse path uses
+        # the same q_up/k_proj weights so SW max suffices.
+        self._last_max_attn_logit: float = 0.0
+
+    def qk_clip_targets(self) -> list[Tensor]:
+        """Q/K projection weights to rescale on QK-Clip trigger."""
+        return [self.q_up.weight, self.k_proj.weight]
+
     def _project_q(self, h: Tensor) -> Tensor:
         b, t, _ = h.shape
         c_q = self.q_compressor(h)
@@ -351,7 +360,17 @@ class CSA(nn.Module):
             sw_mask = (k_pos <= q_pos) & ((q_pos - k_pos) < cfg.sliding_window_size)
         sw_k_h = sw_k.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
         sw_v_h = sw_v.unsqueeze(1).expand(b, n_heads, sw_total_len, cfg.head_dim)
-        sw_attn_out = scaled_dot_product(q, sw_k_h, sw_v_h, mask=sw_mask, sink_logit=self.sink_logit)
+
+        def _observe(scores: Tensor) -> None:
+            # MuonClip telemetry on the SW path; sparse path uses the same
+            # q_up/k_proj weights so SW max is a sufficient signal.
+            self._last_max_attn_logit = float(scores.detach().abs().max())
+
+        sw_attn_out = scaled_dot_product(
+            q, sw_k_h, sw_v_h, mask=sw_mask, sink_logit=self.sink_logit,
+            score_observer=_observe,
+            logit_softcap=self.attn_cfg.logit_softcap,
+        )
 
         return self.output(sparse_attn_out + sw_attn_out)
 

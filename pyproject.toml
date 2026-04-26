@@ -17,6 +17,8 @@ dependencies = [
     "saint-llm-inference",
     "saint-llm-data",
     "saint-llm-eval",
+    "saint-llm-sandbox",
+    "saint-llm-agents",
 ]
 
 [tool.uv.workspace]
@@ -32,6 +34,8 @@ saint-llm-posttraining = { workspace = true }
 saint-llm-inference = { workspace = true }
 saint-llm-data = { workspace = true }
 saint-llm-eval = { workspace = true }
+saint-llm-sandbox = { workspace = true }
+saint-llm-agents = { workspace = true }
 
 [dependency-groups]
 dev = [

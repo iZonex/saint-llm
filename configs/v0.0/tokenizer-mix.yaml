@@ -1,0 +1,191 @@
+# v0.0 BBPE 131K tokenizer training mix per ADR-0004 + ADR-0018.
+#
+# This config drives the tokenizer training step (D0.0.1). Sample
+# proportions are tuned for vocab balance (LANG-02), NOT for total token
+# volume — to avoid English-dominated merges. Each slice contributes
+# roughly its target vocab share.
+#
+# Verified loadable via:
+#   uv run python experiments/verify_hf_datasets.py \
+#     --mix-config configs/v0.0/tokenizer-mix.yaml --probe-rows 5
+#
+# AUTH-REQUIRED slices (commented out by default):
+# - nvidia/Nemotron-CC-v2: gated dataset, needs `huggingface-cli login`
+#   with an HF_TOKEN that has accepted the NVIDIA license.
+# - bigcode/starcoderdata: gated, needs `huggingface-cli login` after
+#   accepting the BigCode usage agreement.
+# Uncomment and re-verify after granting access on the HF Hub side.
+#
+# Usage (after verify):
+#   uv run python experiments/train_tokenizer.py \
+#     --mix-config configs/v0.0/tokenizer-mix.yaml \
+#     --vocab-size 131072 \
+#     --output runs/v0.0/tokenizer.json \
+#     --max-rows-total 5000000
+#
+# The total of `weight` fields across slices need not sum to 1; they
+# are normalized at iteration time.
+
+vocab_size: 131072
+seed: 42
+
+# Special-token set: SAINT_V0_0_SPECIAL_TOKENS from
+# saint_llm_data.tokenizer_trainer (24 reserved control + modality +
+# memory + reasoning + effort + Quick Instruction tokens).
+special_tokens: saint_v0_0
+
+# Force-include alphabet seeds: SAINT_V0_0_FORCE_INCLUDE_CHARS
+# (Ukrainian Cyrillic + apostrophe variants per TOK-03).
+force_include: saint_v0_0
+
+# BPE-dropout per TOK-06.
+dropout: 0.1
+min_frequency: 2
+
+slices:
+  # English web (LANG-01: ~38% Latin allocation)
+  - name: hplt-en
+    weight: 0.20
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "eng_Latn"  # HPLT 3.0 uses ISO 639-3 + ISO 15924 pair
+
+  - name: ultrafineweb-en
+    weight: 0.10
+    hf_dataset: openbmb/Ultra-FineWeb
+    hf_split: "en"  # dataset's split names are "en" / "zh", not "train"
+    hf_text_field: "content"
+
+  - name: fineweb-edu-en
+    weight: 0.05
+    hf_dataset: HuggingFaceFW/fineweb-edu
+    hf_split: "train"
+    hf_text_field: "text"
+
+  # Reasoning slice (English + translated): boosts Diverse-QA share for
+  # multilingual reasoning per DATA-02.
+  # AUTH-REQUIRED: needs `huggingface-cli login` with an HF_TOKEN that
+  # has accepted the NVIDIA Nemotron license. Commented out for the
+  # default no-auth verify path. Uncomment after granting access.
+  # - name: nemotron-cc-v2-diverse-qa
+  #   weight: 0.05
+  #   hf_dataset: nvidia/Nemotron-CC-v2
+  #   hf_split: "train"
+  #   hf_text_field: "text"
+  #   hf_config: "diverse_qa"
+
+  # Chinese (LANG-01: ~30% CJK allocation)
+  - name: hplt-zh
+    weight: 0.14
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "zho_Hans"
+
+  # Russian (LANG-01: 12% Cyrillic, shared with UK)
+  - name: hplt-ru
+    weight: 0.06
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "rus_Cyrl"
+
+  # Ukrainian — primary (Kobza, LANG-03). Weight bumped from 0.05 to 0.07
+  # to absorb the deferred UberText slot and keep UA share near LANG-02
+  # target of ~3.5% of total mix.
+  - name: kobza-uk
+    weight: 0.07
+    hf_dataset: Goader/kobza
+    hf_split: "train"
+    hf_text_field: "text"
+
+  # Ukrainian quality (UberText 2.0, LANG-04, lower MT pollution risk).
+  # NOTE: HF Hub path `lang-uk/UberText-2.0` does not resolve as of
+  # 2026-04-25. UberText 2.0 is hosted by lang.org.ua; integrating it
+  # requires either (a) finding a re-published HF mirror or (b) ingesting
+  # from the original repo via a custom loader. Deferred to v0.0.1 polish.
+  # Until then, Kobza is the sole UA source — its weight absorbs UberText's.
+  # - name: ubertext-uk
+  #   weight: 0.02
+  #   hf_dataset: ...  # TBD pending mirror discovery
+  #   hf_split: "train"
+  #   hf_text_field: "text"
+
+  # Other Latin / Indo-European
+  - name: hplt-es
+    weight: 0.04
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "spa_Latn"
+
+  - name: hplt-fr
+    weight: 0.04
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "fra_Latn"
+
+  - name: hplt-de
+    weight: 0.04
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "deu_Latn"
+
+  - name: hplt-pt
+    weight: 0.02
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "por_Latn"
+
+  - name: hplt-it
+    weight: 0.02
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "ita_Latn"
+
+  # CJK (additional)
+  - name: hplt-ja
+    weight: 0.03
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "jpn_Jpan"
+
+  - name: hplt-ko
+    weight: 0.03
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "kor_Hang"
+
+  # Arabic (LANG-01: ~6% Arabic allocation)
+  - name: hplt-ar
+    weight: 0.02
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "ara_Arab"
+
+  # Devanagari (LANG-01: ~5%)
+  - name: hplt-hi
+    weight: 0.02
+    hf_dataset: HPLT/HPLT2.0_cleaned
+    hf_split: "train"
+    hf_text_field: "text"
+    hf_config: "hin_Deva"
+
+  # Code (LANG-01: ~9% code/byte allocation).
+  # AUTH-REQUIRED: gated dataset, needs `huggingface-cli login` after
+  # accepting the BigCode usage agreement. Commented out for the
+  # default no-auth verify path; uncomment after granting access.
+  # - name: starcoder2-code
+  #   weight: 0.07
+  #   hf_dataset: bigcode/starcoderdata
+  #   hf_split: "train"
+  #   hf_text_field: "content"
+  #   hf_config: "python"

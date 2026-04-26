@@ -23,12 +23,14 @@ from saint_llm_training.losses import (
 from saint_llm_training.rotation import CheckpointRotator
 from saint_llm_training.schedule import warmup_cosine_schedule
 from saint_llm_training.trainer import Trainer
+from saint_llm_training.wandb_logger import WandbLogger
 
 __version__ = "0.0.1"
 
 __all__ = [
     "CheckpointRotator",
     "Trainer",
+    "WandbLogger",
     "cross_entropy_main",
     "cross_entropy_with_mtp",
     "load_checkpoint",

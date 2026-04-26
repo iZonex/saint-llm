@@ -35,6 +35,9 @@ class AttentionConfig(BaseModel):
     rope_dim: int = 64
     rope_theta: float = 10000.0
     use_attention_sink: bool = True
+    # Gemma-style logit softcap per ADR-0012 / ARCH-02. ``None`` disables.
+    # Production v0.0 sets 50.0 (matches Gemma 4 attention cap).
+    logit_softcap: float | None = None
 
 
 class MoEConfig(BaseModel):
@@ -119,6 +122,22 @@ class ModelConfig(BaseModel):
     initializer_range: float = 0.02
     tie_word_embeddings: bool = True
 
+    # Init scheme (ADR-0011 / OPT-02). ``"normal"`` keeps the legacy
+    # ``Normal(0, initializer_range)`` init; ``"umup"`` switches to
+    # u-μP (unit-scaled μP) with per-layer width-aware std and
+    # residual-feeder depth scaling. Production v0.0 uses ``"umup"``.
+    init_scheme: Literal["normal", "umup"] = "normal"
+
+    # Gemma-style final logit softcap (ADR-0012 / ARCH-02). ``None`` disables.
+    # Production v0.0 sets 30.0 (matches Gemma 4 lm_head cap).
+    final_logit_softcap: float | None = None
+    # Learnable sink tokens prepended to every sequence (Streaming-LLM
+    # convention). ``0`` disables; production v0.0 sets 4. Note: v0.0 ships
+    # with sinks as regular learnable prefix tokens — full Streaming-LLM
+    # "always-attend" mask carve-out (sinks visible from beyond SW window)
+    # is deferred to v0.0.1 polish.
+    n_sink_tokens: int = 0
+
     # Linear-layer quantization for QAT-style training.
     # bf16: standard nn.Linear (no quant). fp8: E4M3 with STE (Fp8Linear).
     # fp4:  MXFP4 E2M1 block-32 with STE (Fp4Linear).
@@ -160,15 +179,17 @@ class ModelConfig(BaseModel):
         )
 
     @classmethod
-    def small_flash(cls) -> ModelConfig:
-        """First-real-training config — ~150M params, fits 12 GB hpomen Ada.
+    def small_flash(cls, *, vocab_size: int = 32_768) -> ModelConfig:
+        """First-real-training config — ~150M-280M params, fits 12 GB hpomen Ada.
 
-        Designed for the v0.1 "does the architecture train at scale?" milestone:
+        Designed for the v0.0 "does the architecture train at scale?" milestone:
         validate loss curve shape and basic generation quality on a meaningful
-        corpus (FineWeb-Edu sample) before committing to a multi-GPU run.
+        corpus before committing to a multi-GPU run.
 
         Sizing rationale:
-        * vocab=32768 — matches a tokenizer trainable on a few-GB sample.
+        * vocab — caller passes the actual tokenizer's vocab size. Default
+          32768 keeps backward compat with existing tests; production v0.0
+          targets the BBPE 131K (ADR-0004) — call ``small_flash(vocab_size=131072)``.
         * hidden_dim=768, head_dim=64, query_heads=12 — GPT-2 small footprint.
         * 8 layers, each (CSA/HCA + MoE) — keeps depth modest for hpomen latency.
         * 4 routed experts at 1536 intermediate, top-2 routing — keeps MoE
@@ -179,7 +200,7 @@ class ModelConfig(BaseModel):
             variant="flash",
             n_layers=8,
             hidden_dim=768,
-            vocab_size=32_768,
+            vocab_size=vocab_size,
             first_dense_swa_layers=1,
             csa=CSAConfig(
                 compression_rate=4,

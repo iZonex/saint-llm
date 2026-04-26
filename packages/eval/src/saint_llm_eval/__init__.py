@@ -11,8 +11,13 @@ Suites (planned):
     agent       — Terminal-Bench-2.0/SWE-{Verified,Pro,Multilingual}/BrowseComp/MCPAtlas/Tool-Decathlon/GDPval-AA
 """
 
+from saint_llm_eval.harness import SaintLLMHarnessLM
 from saint_llm_eval.perplexity import compute_perplexity, compute_perplexity_streaming
 
 __version__ = "0.0.1"
 
-__all__ = ["compute_perplexity", "compute_perplexity_streaming"]
+__all__ = [
+    "SaintLLMHarnessLM",
+    "compute_perplexity",
+    "compute_perplexity_streaming",
+]

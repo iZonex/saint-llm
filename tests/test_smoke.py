@@ -15,6 +15,7 @@ PACKAGES = [
     "saint_llm_inference",
     "saint_llm_data",
     "saint_llm_eval",
+    "saint_llm_agents",
 ]
 
 

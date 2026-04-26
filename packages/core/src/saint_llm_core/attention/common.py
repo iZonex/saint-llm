@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 from torch import Tensor, nn
@@ -93,13 +94,30 @@ def scaled_dot_product(
     v: Tensor,
     mask: Tensor | None = None,
     sink_logit: Tensor | None = None,
+    score_observer: Callable[[Tensor], None] | None = None,
+    logit_softcap: float | None = None,
 ) -> Tensor:
     """MQA-friendly attention with optional mask and attention sink.
 
     q: (B, n_heads, T_q, d). k, v: (B, 1, T_k, d) for shared-KV MQA, or matching n_heads.
+
+    ``score_observer`` is called with the post-scale, pre-cap, pre-mask, pre-
+    softmax scores tensor. Used by MuonClip QK-Clip (ADR-0010) to track the
+    maximum attention logit per layer. Default ``None`` is a no-op so the
+    overhead is zero when QK-Clip is not active.
+
+    ``logit_softcap`` (Gemma-style, ADR-0012): when set, attention scores are
+    smoothly bounded to ``[-c, +c]`` via ``c * tanh(scores / c)`` before the
+    mask is applied. ``None`` disables (no-op). Applied AFTER ``score_observer``
+    so QK-Clip sees the raw uncapped logit magnitude — softcap is the
+    forward-time bound; QK-Clip is the post-step weight rescale.
     """
     head_dim = q.shape[-1]
     scores = torch.einsum("bhqd,bhkd->bhqk", q, k) / math.sqrt(head_dim)
+    if score_observer is not None:
+        score_observer(scores)
+    if logit_softcap is not None:
+        scores = logit_softcap * torch.tanh(scores / logit_softcap)
     if mask is not None:
         scores = scores.masked_fill(~mask, float("-inf"))
     probs = softmax_with_sink(scores, sink_logit)
